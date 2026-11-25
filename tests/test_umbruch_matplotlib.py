@@ -1,18 +1,18 @@
-"""Tests against the real helium binary ($HELIUM or PATH); skipped without it."""
+"""Tests against the real umbruch binary ($UMBRUCH or PATH); skipped without it."""
 import io, os, re, shutil, subprocess, sys, tempfile
 import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import matplotlib
-matplotlib.use("module://helium_backend")
+matplotlib.use("module://umbruch_matplotlib")
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 from matplotlib.textpath import TextToPath
-import helium_backend as hb
+import umbruch_matplotlib as hb
 
 out = tempfile.mkdtemp()
-have_helium = hb.get_bridge() is not None
+have_umbruch = hb.get_bridge() is not None
 
 
 def fig_with_everything():
@@ -30,7 +30,7 @@ def fig_with_everything():
 
 
 # 1. malformed rich markup is reported, whatever the bridge
-class Dummy(hb.HeliumBridge):
+class Dummy(hb.UmbruchBridge):
     def measure_many(self, items):
         for m, f in items:
             self._cache[self.key(m, f)] = (10.0, 8.0, 2.0)
@@ -59,14 +59,14 @@ for mode in ("subdivide", "native", "stock"):
 hb.config.gouraud = "subdivide"
 hb.config.bridge = saved
 
-if not have_helium:
-    print("helium not found: skipping the end-to-end tests"); sys.exit(0)
+if not have_umbruch:
+    print("umbruch not found: skipping the end-to-end tests"); sys.exit(0)
 
-# 3. metrics: ink heights/descents come from helium's measure op and must agree with
+# 3. metrics: ink heights/descents come from umbruch's measure op and must agree with
 # Matplotlib's own glyph extents to within 2% of the font size
 hb.config.font_map = {}   # compare like with like: Matplotlib measures DejaVu Sans
 bridge = hb.get_bridge()
-assert isinstance(bridge, hb.HeliumServer), type(bridge)
+assert isinstance(bridge, hb.UmbruchServer), type(bridge)
 assert bridge.request('hello', {})[0]['protocol'] == 1
 for s in ["0.5", "plain label", "Wavy yg"]:
     prop = FontProperties(size=10)

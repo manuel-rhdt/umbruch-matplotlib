@@ -1,4 +1,4 @@
-"""Matplotlib backend that hands text layout and PDF writing to helium.
+"""Matplotlib backend that hands text layout and PDF writing to umbruch.
 
 Pipeline
 --------
@@ -7,35 +7,35 @@ paths, markers, clipping, hatches, images and collections.  Three things
 differ from stock SVG output:
 
 * Text (plain, rich, and math) is written as an XHTML/MathML fragment inside a
-  <foreignObject>, which helium lays out and draws (it supports HTML and MathML
-  there).  Measuring goes through helium too, so Matplotlib's layout (tick
+  <foreignObject>, which umbruch lays out and draws (it supports HTML and MathML
+  there).  Measuring goes through umbruch too, so Matplotlib's layout (tick
   labels, legends, constrained/tight layout, bbox_inches="tight") sees the
-  widths helium will produce.  Heights and descents are the ink extents of the
+  widths umbruch will produce.  Heights and descents are the ink extents of the
   plain text, as with stock Matplotlib, plus what markup adds to the line box
   (sub/superscripts, fractions); the line box itself is used only to place the
   text on its baseline.
 * Gouraud triangles are drawn as flat sub-triangles (``config.gouraud ==
-  "subdivide"``) because helium does not read mesh shadings from SVG yet.
+  "subdivide"``) because umbruch does not read mesh shadings from SVG yet.
   ``"native"`` writes exact vertex colors for a renderer that does.
-* The finished SVG is rendered to PDF by ``helium figure.svg figure.pdf``.
+* The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.
 
 Usage
 -----
     import matplotlib
-    matplotlib.use("module://helium_backend")     # or savefig(..., backend=...)
-    import helium_backend as hb
+    matplotlib.use("module://umbruch_matplotlib")     # or savefig(..., backend=...)
+    import umbruch_matplotlib as hb
     ax.set_title(hb.rich("<i>Rate</i> r<sub>0</sub> in <b>Hz</b>"))
     ax.set_xlabel(r"$\alpha^2$ (needs the latex2mathml package)")
     fig.savefig("out.pdf")
 
-The ``helium`` executable is taken from $HELIUM or PATH.  Rich text is marked by
+The ``umbruch`` executable is taken from $UMBRUCH or PATH.  Rich text is marked by
 a leading U+FEFF (see ``rich``), which survives Matplotlib's string handling.
 The markup must be well-formed XML (numeric entities, not &nbsp;), and a newline
 splits lines as for any Matplotlib text.  ``$...$`` in a plain or rich string is
 converted to MathML by ``config.tex_to_mathml`` (default: latex2mathml).  Math
 that cannot be converted falls back to Matplotlib's own mathtext, drawn as paths.
 
-Tested against Matplotlib 3.11 and helium 0.4.2 (7c77f07); it uses a few private
+Tested against Matplotlib 3.11 and umbruch 0.4.2 (7c77f07); it uses a few private
 attributes of the SVG renderer.
 """
 import io
@@ -138,7 +138,7 @@ def _default_tex_to_mathml(tex):
 
 
 class _Config:
-    #: HeliumBridge instance; if None, HELIUM_CMD / HELIUM_MEASURE_CMD are used.
+    #: UmbruchBridge instance; if None, UMBRUCH_CMD / UMBRUCH_MEASURE_CMD are used.
     bridge = None
     #: callable(tex: str) -> MathML string, or None to use latex2mathml if present.
     #: Without any converter, math falls back to Matplotlib's own mathtext, drawn
@@ -148,7 +148,7 @@ class _Config:
     #: "subdivide"; "subdivide": flat sub-triangles (works with any renderer);
     #: "native": exact vertex colors in data-colors, for a renderer that writes a
     #: type 4 shading; "stock": Matplotlib's three-gradient filter emulation.
-    #: Families Matplotlib asks for -> what helium is asked for instead.  Helium bundles
+    #: Families Matplotlib asks for -> what umbruch is asked for instead.  Umbruch bundles
     #: all four faces of the TeX Gyre families (and only regular and bold of DejaVu Sans),
     #: so by default text is set in those; use {} to ask for exactly what Matplotlib names.
     font_map = {"DejaVu Sans": "TeX Gyre Heros", "DejaVu Sans Mono": "TeX Gyre Cursor",
@@ -160,7 +160,7 @@ class _Config:
 config = _Config()
 
 
-class HeliumBridge:
+class UmbruchBridge:
     """What the backend needs from a renderer.  Units are SVG user units, which are
     CSS px inside a foreignObject and, in Matplotlib's SVG, points."""
 
@@ -217,10 +217,10 @@ class HeliumBridge:
         pass
 
 
-class HeliumCli(HeliumBridge):
-    """Bridge to the ``helium`` executable as it is today.
+class UmbruchCli(UmbruchBridge):
+    """Bridge to the ``umbruch`` executable as it is today.
 
-    Rendering: ``helium in.svg out.pdf`` (an SVG file is one page of the size of
+    Rendering: ``umbruch in.svg out.pdf`` (an SVG file is one page of the size of
     the drawing; foreignObject holds HTML and MathML).
 
     Measuring: there is no measuring mode, so a batch of strings is set in an XHTML
@@ -231,7 +231,7 @@ class HeliumCli(HeliumBridge):
     figure and not per label.
     """
 
-    def __init__(self, executable="helium", args=("--no-system-fonts",), timeout=120):
+    def __init__(self, executable="umbruch", args=("--no-system-fonts",), timeout=120):
         super().__init__()
         self.executable = executable
         self.args = list(args)
@@ -241,7 +241,7 @@ class HeliumCli(HeliumBridge):
         p = subprocess.run([self.executable, *self.args, *argv], capture_output=True,
                            timeout=self.timeout, check=False)
         if p.returncode:
-            raise RuntimeError(f"helium failed ({p.returncode}): "
+            raise RuntimeError(f"umbruch failed ({p.returncode}): "
                                f"{p.stderr.decode(errors='replace')[-2000:]}")
 
     def measure_many(self, items):
@@ -313,8 +313,8 @@ class HeliumCli(HeliumBridge):
                 return fh.read()
 
 
-class HeliumServer(HeliumBridge):
-    """Bridge to one long-lived ``helium --serve`` process (protocol version 1).
+class UmbruchServer(UmbruchBridge):
+    """Bridge to one long-lived ``umbruch --serve`` process (protocol version 1).
 
     Measuring and rendering are requests over stdio, framed as in LSP.  ``measure``
     returns baseline, line box, advance width and ink bounds, so Matplotlib is told
@@ -326,7 +326,7 @@ class HeliumServer(HeliumBridge):
     PROTOCOL = 1
     BATCH = 2000
 
-    def __init__(self, executable="helium", args=("--no-system-fonts",)):
+    def __init__(self, executable="umbruch", args=("--no-system-fonts",)):
         super().__init__()
         self.executable = executable
         self.args = list(args)
@@ -348,14 +348,14 @@ class HeliumServer(HeliumBridge):
             raise
         if hello.get("protocol") != self.PROTOCOL:
             self._kill()
-            raise RuntimeError(f"helium speaks protocol {hello.get('protocol')}, "
+            raise RuntimeError(f"umbruch speaks protocol {hello.get('protocol')}, "
                                f"expected {self.PROTOCOL}")
         self.capabilities = frozenset(hello.get("capabilities", ()))
         missing = {"measure", "render"} - self.capabilities
         if missing:
             self._kill()
-            raise RuntimeError(f"helium --serve lacks {sorted(missing)}")
-        self.version = hello.get("helium")
+            raise RuntimeError(f"umbruch --serve lacks {sorted(missing)}")
+        self.version = hello.get("umbruch")
 
     def _kill(self):
         p, self._proc = self._proc, None
@@ -369,7 +369,7 @@ class HeliumServer(HeliumBridge):
     def _read_exact(self, n):
         data = self._proc.stdout.read(n)
         if len(data) != n:
-            raise EOFError("helium server closed the stream")
+            raise EOFError("umbruch server closed the stream")
         return data
 
     def _exchange(self, op, params):
@@ -382,7 +382,7 @@ class HeliumServer(HeliumBridge):
         while True:
             line = self._proc.stdout.readline()
             if not line:
-                raise EOFError("helium server closed the stream")
+                raise EOFError("umbruch server closed the stream")
             line = line.strip()
             if not line:
                 break
@@ -390,14 +390,14 @@ class HeliumServer(HeliumBridge):
             if name.lower() == "content-length":
                 length = int(value)
         if length is None:
-            raise RuntimeError("helium server sent a frame without Content-Length")
+            raise RuntimeError("umbruch server sent a frame without Content-Length")
         reply = json.loads(self._read_exact(length))
         if reply.get("id") != self._next_id:
-            raise RuntimeError(f"helium server answered request {reply.get('id')}, "
+            raise RuntimeError(f"umbruch server answered request {reply.get('id')}, "
                                f"expected {self._next_id}")
         if not reply.get("ok"):
             e = reply.get("error", {})
-            raise RuntimeError(f"helium {op} failed: {e.get('code')}: {e.get('message')}")
+            raise RuntimeError(f"umbruch {op} failed: {e.get('code')}: {e.get('message')}")
         result = reply["result"]
         attachment = self._read_exact(result["attachment_length"]) \
             if result.get("attachment_length") else b""
@@ -413,7 +413,7 @@ class HeliumServer(HeliumBridge):
                 except (EOFError, BrokenPipeError, OSError):
                     self._kill()
                     if attempt:
-                        raise RuntimeError("the helium server keeps exiting") from None
+                        raise RuntimeError("the umbruch server keeps exiting") from None
 
     # -- bridge --------------------------------------------------------------
 
@@ -426,7 +426,7 @@ class HeliumServer(HeliumBridge):
                 {"markup": m, "css": f["css"]} for m, f in chunk]})
             for (markup, font), m in zip(chunk, result["metrics"]):
                 if "error" in m:
-                    raise RuntimeError(f"helium could not measure {markup!r}: {m['error']}")
+                    raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
                 ink = m["ink"]
                 if ink is None:  # nothing painted (spaces)
                     h = d = 0.0
@@ -445,7 +445,7 @@ class HeliumServer(HeliumBridge):
             "document": {"source": svg, "kind": "xml"}, "options": {}})
         for w in result.get("warnings", ()):
             if "no `lang`" not in str(w):  # PDF/UA is not a goal of a plot
-                log.warning("helium: %s", w)
+                log.warning("umbruch: %s", w)
         return pdf
 
     def close(self):
@@ -467,32 +467,32 @@ class HeliumServer(HeliumBridge):
                 p.kill()
 
 
-def find_helium():
-    """The helium executable: $HELIUM, the one installed with the ``helium-pdf`` package,
-    or ``helium`` on PATH."""
-    exe = os.environ.get("HELIUM")
+def find_umbruch():
+    """The umbruch executable: $UMBRUCH, the one installed with the ``umbruch`` package,
+    or ``umbruch`` on PATH."""
+    exe = os.environ.get("UMBRUCH")
     if exe:
         return exe
     try:
-        import helium_pdf
-        exe = helium_pdf.find_helium()
+        import umbruch
+        exe = umbruch.find_umbruch()
     except ImportError:
         exe = None
-    return exe or shutil.which("helium")
+    return exe or shutil.which("umbruch")
 
 
 def get_bridge():
     if config.bridge is None:
-        exe = find_helium()
+        exe = find_umbruch()
         if exe is None:
             return None
-        server = HeliumServer(exe)
+        server = UmbruchServer(exe)
         try:
             server._start()
             config.bridge = server
         except Exception as e:
-            log.info("helium --serve is not available (%s); one process per batch", e)
-            config.bridge = HeliumCli(exe)
+            log.info("umbruch --serve is not available (%s); one process per batch", e)
+            config.bridge = UmbruchCli(exe)
     return config.bridge
 
 
@@ -553,7 +553,7 @@ class _RawWriter(_XMLWriter):
         self._XMLWriter__write(s)
 
 
-class RendererHelium(RendererSVG):
+class RendererUmbruch(RendererSVG):
     def __init__(self, width, height, svgwriter, basename=None, image_dpi=72,
                  *, metadata=None, bridge=None):
         super().__init__(width, height, svgwriter, basename, image_dpi,
@@ -567,11 +567,11 @@ class RendererHelium(RendererSVG):
         return self.bridge is not None and self.bridge.handles_text
 
     def _markup(self, s, ismath):
-        """Inline XHTML/MathML for *s*.  What helium cannot set is an error: there is
+        """Inline XHTML/MathML for *s*.  What umbruch cannot set is an error: there is
         no quiet fallback to Matplotlib's own mathtext or usetex rendering."""
         if ismath == "TeX":
             raise NotImplementedError(
-                "text.usetex is not supported by the helium backend; use mathtext "
+                "text.usetex is not supported by the umbruch backend; use mathtext "
                 "($...$), which is converted to MathML, or rich()")
         is_rich = s.startswith(RICH_MARK)
         if is_rich:
@@ -596,7 +596,7 @@ class RendererHelium(RendererSVG):
         return "".join(out)
 
     def _degrade(self, s):
-        """Without helium text support, rich markup is reduced to plain text."""
+        """Without umbruch text support, rich markup is reduced to plain text."""
         if isinstance(s, str) and s.startswith(RICH_MARK):
             return _TAG_RE.sub("", s[1:])
         return s
@@ -615,7 +615,7 @@ class RendererHelium(RendererSVG):
         w, h, d = self.bridge.measure(markup, font)
         asc, box_h = self.bridge.ascent(markup, font)
         alpha = gc.get_alpha() if gc.get_forced_alpha() else gc.get_rgb()[3]
-        # the same declarations as the probe of HeliumCli.measure_many, plus paint
+        # the same declarations as the probe of UmbruchCli.measure_many, plus paint
         pad = 0.25 * font["size"]
         style = (f"margin:{_fmt(pad)}px 0 0 {_fmt(pad)}px;padding:0;"
                  f"white-space:pre;line-height:normal;"
@@ -660,7 +660,7 @@ class RendererHelium(RendererSVG):
         if cols.shape[-1] == 3:
             cols = np.concatenate([cols, np.ones(cols.shape[:-1] + (1,))], axis=-1)
         wr.start("g", **self._get_clip_attrs(gc))
-        wr.start("g", attrib={"data-helium-mesh": "gouraud"})
+        wr.start("g", attrib={"data-umbruch-mesh": "gouraud"})
         for pts, c in zip(triangles_array, cols):
             p = trans.transform(pts)
             if mode == "native":
@@ -711,9 +711,9 @@ class RendererHelium(RendererSVG):
                               np.mean([q[1] for q in dn], axis=0), seam=True)
 
 
-class FigureCanvasHelium(FigureCanvasSVG):
-    filetypes = {"pdf": "Portable Document Format (helium)",
-                 "svg": "SVG with helium extensions"}
+class FigureCanvasUmbruch(FigureCanvasSVG):
+    filetypes = {"pdf": "Portable Document Format (umbruch)",
+                 "svg": "SVG with umbruch extensions"}
 
     def get_default_filetype(self):
         return "pdf"
@@ -725,7 +725,7 @@ class FigureCanvasHelium(FigureCanvasSVG):
         w, h = width * 72, height * 72
         renderer = MixedModeRenderer(
             self.figure, width, height, dpi,
-            RendererHelium(w, h, fh, image_dpi=dpi, metadata=metadata, bridge=bridge),
+            RendererUmbruch(w, h, fh, image_dpi=dpi, metadata=metadata, bridge=bridge),
             bbox_inches_restore=bbox_inches_restore)
         self.figure.draw(renderer)
         renderer.finalize()
@@ -762,8 +762,8 @@ class FigureCanvasHelium(FigureCanvasSVG):
         bridge = get_bridge()
         if bridge is None:
             raise RuntimeError(
-                "No helium bridge: set helium_backend.config.bridge, or "
-                "HELIUM_CMD and HELIUM_MEASURE_CMD")
+                "No umbruch bridge: set umbruch_matplotlib.config.bridge, or "
+                "UMBRUCH_CMD and UMBRUCH_MEASURE_CMD")
         self._prefetch(bridge)
         buf = io.StringIO()
         w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
@@ -772,4 +772,4 @@ class FigureCanvasHelium(FigureCanvasSVG):
             fh.write(data)
 
 
-FigureCanvas = FigureCanvasHelium
+FigureCanvas = FigureCanvasUmbruch
