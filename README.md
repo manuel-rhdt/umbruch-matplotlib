@@ -3,7 +3,7 @@
 A Matplotlib backend that draws figures as SVG and renders them to PDF with
 [helium](https://github.com/manuel-rhdt/helium). Text and math are laid out by helium:
 labels may contain rich text (`rich("<i>t</i><sub>0</sub>")`) and `$...$` math is converted to
-MathML. Needs a helium binary with `--serve` (set `$HELIUM` or put it on `PATH`).
+MathML. The helium executable comes with the `helium-pdf` package; `$HELIUM` or `PATH` override it.
 
 ```python
 import matplotlib

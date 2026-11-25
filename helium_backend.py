@@ -467,9 +467,23 @@ class HeliumServer(HeliumBridge):
                 p.kill()
 
 
+def find_helium():
+    """The helium executable: $HELIUM, the one installed with the ``helium-pdf`` package,
+    or ``helium`` on PATH."""
+    exe = os.environ.get("HELIUM")
+    if exe:
+        return exe
+    try:
+        import helium_pdf
+        exe = helium_pdf.find_helium()
+    except ImportError:
+        exe = None
+    return exe or shutil.which("helium")
+
+
 def get_bridge():
     if config.bridge is None:
-        exe = os.environ.get("HELIUM") or shutil.which("helium")
+        exe = find_helium()
         if exe is None:
             return None
         server = HeliumServer(exe)
