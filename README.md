@@ -24,8 +24,9 @@ Install with `pip install .[math]` (the `math` extra pulls in `latex2mathml`).
 Unsupported features raise instead of falling back to Matplotlib's own text rendering:
 `text.usetex`, and TeX that cannot be converted to MathML.
 
-Defaults: DejaVu families are mapped to the bundled TeX Gyre fonts (`config.font_map`),
-Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
+Fonts are passed to umbruch exactly as Matplotlib names them; nothing is remapped. Umbruch bundles all four faces of TeX Gyre Heros, Cursor and Termes, but only the regular and bold faces of DejaVu Sans, so with Matplotlib's default family italic text is set upright. Set the family you want, for example `matplotlib.rcParams["font.family"] = "TeX Gyre Heros"`.
+
+Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math. Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
 
 ## Examples
 

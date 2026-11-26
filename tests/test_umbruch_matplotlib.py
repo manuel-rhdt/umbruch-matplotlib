@@ -64,7 +64,6 @@ if not have_umbruch:
 
 # 3. metrics: ink heights/descents come from umbruch's measure op and must agree with
 # Matplotlib's own glyph extents to within 2% of the font size
-hb.config.font_map = {}   # compare like with like: Matplotlib measures DejaVu Sans
 bridge = hb.get_bridge()
 assert isinstance(bridge, hb.UmbruchServer), type(bridge)
 assert bridge.request('hello', {})[0]['protocol'] == 1
@@ -77,7 +76,6 @@ w, h, d = bridge.measure("E = mc<sup>2</sup>", hb._font_spec(FontProperties(size
 _, h0, _ = bridge.measure("E = mc2", hb._font_spec(FontProperties(size=10)))
 assert h > h0, "a superscript must make the box taller"
 
-hb.config.font_map = type(hb.config).font_map
 bridge._cache.clear()
 
 # 4. end to end: PDF, tight bbox, text is real text
@@ -111,6 +109,23 @@ plt.close(fig)
 print("failure tests ok")
 
 
+def test_tick_label_exponents_use_the_text_font():
+    import matplotlib.pyplot as plt, subprocess, tempfile
+    fig, ax = plt.subplots()
+    ax.loglog([1, 1e4], [1e-3, 1e3])
+    path = os.path.join(tempfile.mkdtemp(), "log.pdf")
+    fig.savefig(path)
+    fonts = subprocess.run(["pdffonts", path], capture_output=True, text=True).stdout
+    assert "STIX" not in fonts, fonts
+    for bad in (r"\mathdefault{\alpha}",):
+        try:
+            hb._mathdefault_html(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsupported macro must raise")
+
+
 def test_single_letter_mathrm_is_upright():
     import umbruch_matplotlib as u
     ml = u._default_tex_to_mathml(r"\mathrm{s}^{-1}")
@@ -119,4 +134,5 @@ def test_single_letter_mathrm_is_upright():
 
 
 if __name__ == "__main__":
+    test_tick_label_exponents_use_the_text_font()
     test_single_letter_mathrm_is_upright()

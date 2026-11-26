@@ -1,5 +1,6 @@
 import os
 import numpy as np, matplotlib; matplotlib.use("module://umbruch_matplotlib")
+matplotlib.rcParams["font.family"] = "TeX Gyre Heros"   # ships with umbruch; has italic and bold
 import matplotlib.pyplot as plt
 from umbruch_matplotlib import rich
 

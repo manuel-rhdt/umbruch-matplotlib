@@ -152,11 +152,6 @@ class _Config:
     #: "subdivide"; "subdivide": flat sub-triangles (works with any renderer);
     #: "native": exact vertex colors in data-colors, for a renderer that writes a
     #: type 4 shading; "stock": Matplotlib's three-gradient filter emulation.
-    #: Families Matplotlib asks for -> what umbruch is asked for instead.  Umbruch bundles
-    #: all four faces of the TeX Gyre families (and only regular and bold of DejaVu Sans),
-    #: so by default text is set in those; use {} to ask for exactly what Matplotlib names.
-    font_map = {"DejaVu Sans": "TeX Gyre Heros", "DejaVu Sans Mono": "TeX Gyre Cursor",
-                "DejaVu Serif": "TeX Gyre Termes"}
     gouraud = "auto"
     gouraud_max_level = 8
 
@@ -510,7 +505,7 @@ def _font_spec(prop):
             names += ["sans-serif" if n in ("sans", "sans serif") else n
                       for n in fm.FontManager._expand_aliases(entry)]
         names.append(entry)
-    names = list(dict.fromkeys(config.font_map.get(n, n) for n in names))
+    names = list(dict.fromkeys(names))
     quoted = [n if n in fm.font_family_aliases or n == "sans-serif" else repr(n)
               for n in names]
     return {"prop": prop, "family": names, "size": float(prop.get_size()), "weight": int(weight),
@@ -521,6 +516,78 @@ def _font_spec(prop):
                     f"font-variant:{prop.get_variant()}"
                     + ("" if prop.get_stretch() == "normal" else
                        f";font-stretch:{prop.get_stretch()}"))}
+
+
+_TEXT_MACROS = {"times": "\u00d7", "cdot": "\u00b7", "pm": "\u00b1", ",": "\u2009",
+                ";": "\u2005", " ": " ", "%": "%", "_": "_", "{": "{", "}": "}",
+                "$": "$", "#": "#", "&": "&"}
+
+
+def _mathdefault_html(tex):
+    """Matplotlib wraps tick labels in ``\\mathdefault{...}`` to say "set this in the
+    regular text font" (``10^{3}``, ``1\\times10^{-2}``).  That is text with scripts,
+    not math, so it becomes inline XHTML in the surrounding font.  Anything beyond that
+    small subset raises ValueError."""
+    def group(i, closing):
+        out = []
+        while i < len(tex):
+            c = tex[i]
+            if c == "}":
+                if closing:
+                    return "".join(out), i + 1
+                raise ValueError(f"unbalanced '}}' in {tex!r}")
+            if c == "\\":
+                j = i + 1
+                if j < len(tex) and tex[j].isalpha():
+                    while j < len(tex) and tex[j].isalpha():
+                        j += 1
+                    name = tex[i + 1:j]
+                else:
+                    name, j = tex[i + 1:j + 1], j + 1
+                if name == "mathdefault":
+                    if j >= len(tex) or tex[j] != "{":
+                        raise ValueError(f"\\mathdefault needs a braced argument in {tex!r}")
+                    inner, i = group(j + 1, True)
+                    out.append(inner)
+                elif name in _TEXT_MACROS:
+                    out.append(escape(_TEXT_MACROS[name]))
+                    i = j
+                else:
+                    raise ValueError(f"\\{name} is not supported in \\mathdefault text "
+                                     f"{tex!r}")
+            elif c in "^_":
+                tag = "sup" if c == "^" else "sub"
+                i += 1
+                if i >= len(tex):
+                    raise ValueError(f"dangling {c!r} in {tex!r}")
+                if tex[i] == "{":
+                    inner, i = group(i + 1, True)
+                else:
+                    inner, i = group_one(i)
+                out.append(f"<{tag}>{inner}</{tag}>")
+            elif c == "{":
+                inner, i = group(i + 1, True)
+                out.append(inner)
+            else:
+                out.append(escape("\u2212" if c == "-" else c))
+                i += 1
+        if closing:
+            raise ValueError(f"unbalanced '{{' in {tex!r}")
+        return "".join(out), i
+
+    def group_one(i):
+        # a single character or macro as script argument
+        if tex[i] == "\\":
+            j = i + 2 if not tex[i + 1:i + 2].isalpha() else i + 1
+            while j < len(tex) and tex[i + 1:i + 2].isalpha() and tex[j].isalpha():
+                j += 1
+            return group_sub(tex[i:j]), j
+        return escape("\u2212" if tex[i] == "-" else tex[i]), i + 1
+
+    def group_sub(piece):
+        return _mathdefault_html(piece)
+
+    return group(0, False)[0]
 
 
 _MATH_RE = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$", re.S)
@@ -586,6 +653,11 @@ class RendererUmbruch(RendererSVG):
         conv = config.tex_to_mathml or _default_tex_to_mathml
         out, pos = [], 0
         for m in _MATH_RE.finditer(s):
+            if m.group(1).lstrip().startswith("\\mathdefault{"):
+                out.append(esc(s[pos:m.start()]).replace(r"\$", "$"))
+                out.append(_mathdefault_html(m.group(1).strip()))
+                pos = m.end()
+                continue
             try:
                 ml = conv(m.group(1))
             except Exception as e:  # a converter that cannot read this TeX
