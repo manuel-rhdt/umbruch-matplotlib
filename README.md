@@ -27,4 +27,20 @@ Unsupported features raise instead of falling back to Matplotlib's own text rend
 Defaults: DejaVu families are mapped to the bundled TeX Gyre fonts (`config.font_map`),
 Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
 
+## Examples
+
+Rich text through `rich()`: inline markup for italics, bold, sub- and superscripts, colour and size, in titles, labels, tick labels and annotations.
+
+![Rich text](docs/rich_text.png)
+
+Math is laid out as MathML with STIX Two Math, with correct operator spacing and function application, and can be mixed with rich text.
+
+![Math](docs/math.png)
+
+A larger figure with hatching, gradients, colour bars, annotations, and math and rich text in titles, labels and legends. The output is a vector PDF whose text stays selectable.
+
+![Showcase](docs/showcase.png)
+
+The scripts are in `examples/`. `python examples/make_images.py` re-renders the PNGs (needs `pdftoppm` and an `umbruch` binary on `$UMBRUCH` or the path).
+
 Tests: `UMBRUCH=/path/to/umbruch python tests/test_umbruch_matplotlib.py`.

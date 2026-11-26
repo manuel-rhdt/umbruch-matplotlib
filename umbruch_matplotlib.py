@@ -101,7 +101,11 @@ def _fix_mathml(ml):
     function application (no space before the argument), and the periods in
     ``\\mathrm{a.u.}`` are operators (spaced).  These are repaired.
     """
+    import re
     import unicodedata
+    # latex2mathml drops the upright style of a single-letter \mathrm{s}; it is the only
+    # input that yields the zero-padded ASCII entity, so mark exactly those as upright.
+    ml = re.sub(r"<mi>(&#x000[0-9A-Fa-f]{2};)</mi>", r'<mi mathvariant="normal">\1</mi>', ml)
     ns = "{%s}" % _MATHML_NS
     root = ET.fromstring(ml)
     for el in root.iter():

@@ -109,3 +109,14 @@ except RuntimeError as e:
     assert "MathML" in str(e), e
 plt.close(fig)
 print("failure tests ok")
+
+
+def test_single_letter_mathrm_is_upright():
+    import umbruch_matplotlib as u
+    ml = u._default_tex_to_mathml(r"\mathrm{s}^{-1}")
+    assert 'mathvariant="normal">s<' in ml, ml
+    assert 'mathvariant="normal"' not in u._default_tex_to_mathml("s")
+
+
+if __name__ == "__main__":
+    test_single_letter_mathrm_is_upright()
