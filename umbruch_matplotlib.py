@@ -183,19 +183,20 @@ class _Config:
     #: Matplotlib only knows sRGB, so a color outside sRGB is plotted as an sRGB
     #: stand-in and replaced here by its exact CSS Color 4 form (``oklch(...)``,
     #: ``lab(...)``, ``color(rec2020 ...)``), which umbruch writes as a wide-gamut
-    #: color.  Needs an umbruch that reads wide colors in SVG.  Every occurrence of
-    #: the stand-in hex in the SVG (fills, strokes, text colors) is replaced.
+    #: color.  Needs an umbruch that reads wide colors in SVG.  It is replaced where a
+    #: color is painted (fill, stroke, stop-color, color), not in the text of a label.
     wide_colors = {}
 
 
-_HEX = re.compile(r"#[0-9a-fA-F]{6}\b")
+# only where a color is painted (fill="#..", style="fill: #..", color: #..), not in the text of a label
+_HEX = re.compile(r"((?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*[\"']?\s*)(#[0-9a-fA-F]{6})\b")
 
 
 def _apply_wide_colors(svg, mapping):
     if not mapping:
         return svg
     lut = {k.lower(): v for k, v in mapping.items()}
-    return _HEX.sub(lambda m: lut.get(m.group(0).lower(), m.group(0)), svg)
+    return _HEX.sub(lambda m: m.group(1) + lut.get(m.group(2).lower(), m.group(2)), svg)
 
 
 config = _Config()
