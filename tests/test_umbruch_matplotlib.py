@@ -133,6 +133,34 @@ def test_single_letter_mathrm_is_upright():
     assert 'mathvariant="normal"' not in u._default_tex_to_mathml("s")
 
 
+def test_math_font_is_set_on_math_elements():
+    f = hb._set_math_font
+    assert f("<math><mi>x</mi></math>", "Foo Math") == \
+        "<math style=\"font-family:'Foo Math'\"><mi>x</mi></math>"
+    out = f('<math display="block" style="color:red"><mi>x</mi></math>', "A, B")
+    assert out.startswith('<math display="block" style="font-family:\'A\', \'B\';color:red">'), out
+
+
+def test_math_font_changes_the_pdf_font():
+    if not have_umbruch:
+        return
+    def fonts(family):
+        hb.config.math_font = family
+        try:
+            fig = plt.figure(figsize=(2, 1))
+            fig.text(0.1, 0.4, r"$\alpha^2+\frac{a}{b}$")
+            path = os.path.join(out, "mathfont.pdf")
+            fig.savefig(path)
+            plt.close(fig)
+        finally:
+            hb.config.math_font = None
+        return subprocess.run(["pdffonts", path], capture_output=True, text=True).stdout
+    assert "LatinModern" in fonts("Latin Modern Math")
+    assert "STIXTwo" in fonts("STIX Two Math")
+
+
 if __name__ == "__main__":
+    test_math_font_is_set_on_math_elements()
+    test_math_font_changes_the_pdf_font()
     test_tick_label_exponents_use_the_text_font()
     test_single_letter_mathrm_is_upright()

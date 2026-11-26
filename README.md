@@ -26,7 +26,7 @@ Unsupported features raise instead of falling back to Matplotlib's own text rend
 
 Fonts are passed to umbruch exactly as Matplotlib names them; nothing is remapped. Umbruch bundles all four faces of TeX Gyre Heros, Cursor and Termes, but only the regular and bold faces of DejaVu Sans, so with Matplotlib's default family italic text is set upright. Set the family you want, for example `matplotlib.rcParams["font.family"] = "TeX Gyre Heros"`.
 
-Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math. Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
+Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and, by default, set in umbruch's built-in math fonts. `umbruch_matplotlib.config.math_font = "Noto Sans Math"` chooses another family; it must have an OpenType `MATH` table and be known to umbruch (installed, or a directory passed with `--font-dir`), or umbruch falls back to the built-in fonts without warning. Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
 
 ## Examples
 

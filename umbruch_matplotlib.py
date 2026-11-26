@@ -132,6 +132,26 @@ def _fix_mathml(ml):
     return ET.tostring(root, encoding="unicode")
 
 
+_MATH_TAG_RE = re.compile(r"<math\b[^>]*>")
+
+
+def _set_math_font(ml, family):
+    """Add ``font-family:family`` to the style of every <math> start tag in *ml*."""
+    decl = "font-family:" + ", ".join(
+        repr(f.strip()) for f in family.split(",")) if isinstance(family, str) else None
+    if not decl:
+        raise TypeError("config.math_font must be a font family name or None")
+    decl = escape(decl, {'"': "&quot;"})
+
+    def add(m):
+        tag = m.group(0)
+        if re.search(r'\sstyle\s*=\s*"', tag):
+            return re.sub(r'(\sstyle\s*=\s*")', lambda k: k.group(1) + decl + ";", tag, count=1)
+        end = "/>" if tag.endswith("/>") else ">"
+        return tag[:-len(end)] + f' style="{decl}"' + end
+    return _MATH_TAG_RE.sub(add, ml)
+
+
 def _default_tex_to_mathml(tex):
     try:
         from latex2mathml.converter import convert
@@ -154,6 +174,11 @@ class _Config:
     #: type 4 shading; "stock": Matplotlib's three-gradient filter emulation.
     gouraud = "auto"
     gouraud_max_level = 8
+    #: Font family for the formulas of ``$...$`` (written as ``font-family`` on each
+    #: <math> element), or None.  The font must have an OpenType MATH table; otherwise
+    #: umbruch uses its built-in Latin Modern Math / STIX Two Math.  The font has to be
+    #: known to umbruch (installed, or in a directory given to it with ``--font-dir``).
+    math_font = None
 
 
 config = _Config()
@@ -665,6 +690,8 @@ class RendererUmbruch(RendererSVG):
             if ml is None:
                 raise RuntimeError(f"cannot convert math {m.group(1)!r} to MathML: the "
                                    "converter returned None")
+            if config.math_font:
+                ml = _set_math_font(ml, config.math_font)
             out.append(esc(s[pos:m.start()]).replace(r"\$", "$"))
             out.append(ml)
             pos = m.end()
