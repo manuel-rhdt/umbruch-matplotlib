@@ -17,7 +17,8 @@ differ from stock SVG output:
 * Gouraud triangles are drawn as flat sub-triangles (``config.gouraud ==
   "subdivide"``) because umbruch does not read mesh shadings from SVG yet.
   ``"native"`` writes exact vertex colors for a renderer that does.
-* The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.
+* The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.  PNG output
+  rasterizes that PDF with hayro (the ``hayro-raster`` executable, see ``rasterize_pdf``).
 
 Usage
 -----
@@ -480,6 +481,44 @@ def find_umbruch():
     return exe or shutil.which("umbruch")
 
 
+def find_hayro_raster():
+    """The ``hayro-raster`` executable: $HAYRO_RASTER, the one installed with the
+    ``hayro-raster`` package, ``hayro-raster`` on PATH, or a release build in this
+    checkout (``hayro-raster/target/release``)."""
+    exe = os.environ.get("HAYRO_RASTER")
+    if exe:
+        return exe
+    try:
+        import hayro_raster
+        exe = hayro_raster.find_hayro_raster()
+    except ImportError:
+        exe = shutil.which("hayro-raster")
+    if exe is None:
+        name = "hayro-raster.exe" if os.name == "nt" else "hayro-raster"
+        built = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "hayro-raster", "target", "release", name)
+        exe = built if os.path.isfile(built) else None
+    return exe
+
+
+def rasterize_pdf(pdf, dpi, page=1):
+    """PNG bytes of page *page* of the PDF *pdf* (bytes) at *dpi*, drawn by hayro.
+
+    The image is ``round(width_pt * dpi / 72)`` by ``round(height_pt * dpi / 72)``
+    pixels and transparent wherever the PDF paints nothing."""
+    exe = find_hayro_raster()
+    if exe is None:
+        raise RuntimeError(
+            "PNG output needs the hayro-raster executable: pip install ./hayro-raster, "
+            "or cargo install --path hayro-raster, or set $HAYRO_RASTER")
+    p = subprocess.run([exe, "--dpi", repr(float(dpi)), "--page", str(page), "-", "-"],
+                       input=pdf, capture_output=True, check=False)
+    if p.returncode:
+        raise RuntimeError(f"hayro-raster failed ({p.returncode}): "
+                           f"{p.stderr.decode(errors='replace')[-2000:]}")
+    return p.stdout
+
+
 def get_bridge():
     if config.bridge is None:
         exe = find_umbruch()
@@ -789,6 +828,7 @@ class RendererUmbruch(RendererSVG):
 
 class FigureCanvasUmbruch(FigureCanvasSVG):
     filetypes = {"pdf": "Portable Document Format (umbruch)",
+                 "png": "Portable Network Graphics (umbruch, rasterized by hayro)",
                  "svg": "SVG with umbruch extensions"}
 
     def get_default_filetype(self):
@@ -833,8 +873,7 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
                 fh = codecs.getwriter("utf-8")(fh)
             self._draw_to(fh, bridge, bbox_inches_restore, metadata)
 
-    def print_pdf(self, filename, *, bbox_inches_restore=None, metadata=None,
-                  **kwargs):
+    def _render_pdf(self, bbox_inches_restore):
         bridge = get_bridge()
         if bridge is None:
             raise RuntimeError(
@@ -843,7 +882,26 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
         self._prefetch(bridge)
         buf = io.StringIO()
         w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
-        data = bridge.render(buf.getvalue(), w, h)
+        return bridge.render(buf.getvalue(), w, h)
+
+    def print_pdf(self, filename, *, bbox_inches_restore=None, metadata=None,
+                  **kwargs):
+        data = self._render_pdf(bbox_inches_restore)
+        with cbook.open_file_cm(filename, "wb") as fh:
+            fh.write(data)
+
+    def print_png(self, filename, *, bbox_inches_restore=None, metadata=None,
+                  **kwargs):
+        """Render the figure to PDF with umbruch and rasterize that with hayro, at the
+        figure's dpi (``savefig(dpi=...)``).  The background is transparent only if the
+        figure and axes patches are (``savefig(transparent=True)``).  ``metadata`` and
+        ``pil_kwargs`` are not supported."""
+        if metadata:
+            raise ValueError("PNG metadata is not supported by the umbruch backend")
+        if kwargs.get("pil_kwargs"):
+            raise ValueError("pil_kwargs are not supported by the umbruch backend")
+        dpi = self.figure.dpi          # _draw_to leaves it at 72
+        data = rasterize_pdf(self._render_pdf(bbox_inches_restore), dpi)
         with cbook.open_file_cm(filename, "wb") as fh:
             fh.write(data)
 

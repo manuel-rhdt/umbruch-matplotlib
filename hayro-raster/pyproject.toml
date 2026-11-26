@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hayro-raster"
+dynamic = ["version"]
+description = "Render a page of a PDF to PNG with hayro (the hayro-raster executable as a Python package)"
+requires-python = ">=3.9"
+license = "MIT"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+# A wheel with the compiled executable, installed into the environment's scripts directory.
+bindings = "bin"
+python-source = "python"
+module-name = "hayro_raster"
+strip = true

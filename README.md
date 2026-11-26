@@ -19,6 +19,8 @@ ax.set_title(r"$\hat\rho_{ij}=\frac{a}{b}$")
 fig.savefig("fig.pdf")
 ```
 
+`fig.savefig("fig.png", dpi=200)` also works: the PDF from umbruch is rasterized by [hayro](https://github.com/LaurenzV/hayro) through the small `hayro-raster` executable in `hayro-raster/` (`pip install ./hayro-raster`, which needs Rust and maturin, or `cargo install --path hayro-raster`; `$HAYRO_RASTER` overrides the lookup). The image is `round(width_in × dpi)` by `round(height_in × dpi)` pixels. PNG `metadata` and `pil_kwargs` are not supported, and other raster formats (JPEG, TIFF) are not provided.
+
 Install with `pip install .[math]` (the `math` extra pulls in `latex2mathml`).
 
 Unsupported features raise instead of falling back to Matplotlib's own text rendering:
@@ -44,7 +46,7 @@ A larger figure with hatching, gradients, colour bars, annotations, and math and
 
 The scripts are in `examples/`. `python examples/make_images.py` re-renders the PNGs (needs `pdftoppm` and an `umbruch` binary on `$UMBRUCH` or the path).
 
-Tests: `UMBRUCH=/path/to/umbruch python tests/test_umbruch_matplotlib.py`.
+Tests: `UMBRUCH=/path/to/umbruch [HAYRO_RASTER=/path/to/hayro-raster] python tests/test_umbruch_matplotlib.py`.
 
 ## License
 

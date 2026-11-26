@@ -1,5 +1,5 @@
 """Tests against the real umbruch binary ($UMBRUCH or PATH); skipped without it."""
-import io, os, re, shutil, subprocess, sys, tempfile
+import io, os, re, shutil, struct, subprocess, sys, tempfile
 import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -133,6 +133,24 @@ def test_single_letter_mathrm_is_upright():
     assert 'mathvariant="normal"' not in u._default_tex_to_mathml("s")
 
 
+def test_png_is_rasterized_by_hayro():
+    if not (have_umbruch and hb.find_hayro_raster()):
+        print("png test skipped (needs umbruch and hayro-raster)")
+        return
+    fig = fig_with_everything()
+    path = os.path.join(out, "fig.png")
+    fig.savefig(path, dpi=150)
+    d = open(path, "rb").read()
+    assert d[:8] == b"\x89PNG\r\n\x1a\n", d[:8]
+    w, h = struct.unpack(">II", d[16:24])
+    assert (w, h) == (750, 525), (w, h)          # 5 x 3.5 in at 150 dpi
+    assert (d[24], d[25]) == (8, 6), d[24:26]    # 8-bit RGBA
+    fig.savefig(path, dpi=150, transparent=True)
+    assert open(path, "rb").read() != d
+    plt.close(fig)
+
+
 if __name__ == "__main__":
+    test_png_is_rasterized_by_hayro()
     test_tick_label_exponents_use_the_text_font()
     test_single_letter_mathrm_is_upright()
