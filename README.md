@@ -44,3 +44,7 @@ A larger figure with hatching, gradients, colour bars, annotations, and math and
 The scripts are in `examples/`. `python examples/make_images.py` re-renders the PNGs (needs `pdftoppm` and an `umbruch` binary on `$UMBRUCH` or the path).
 
 Tests: `UMBRUCH=/path/to/umbruch python tests/test_umbruch_matplotlib.py`.
+
+## License
+
+MIT, see `LICENSE`.
