@@ -51,6 +51,7 @@ import base64
 import functools
 import hashlib
 import io
+import itertools
 import os
 import re
 import logging
@@ -417,6 +418,24 @@ class UmbruchServer(UmbruchBridge):
         if missing:
             raise umbruch.Error("server", f"umbruch --serve lacks {sorted(missing)}")
 
+    _requests = itertools.count()
+
+    @classmethod
+    def _fresh_aliases(cls, rules, probes):
+        """*rules* and *probes* [(markup, css), ...] with the family name of every embedded face made
+        unique to this request.  umbruch's server (0.5.2) applies an @font-face family only in the
+        first request that declares it: a later request that declares it again, or none, measures
+        in the fallback font (for Noto Sans 9 % too narrow, so that text was cut off where
+        it overflowed its box).  The names in the cache keys and in the SVG stay as they are."""
+        tag = f"-{next(cls._requests)}"
+        aliases = set(re.findall(r"font-family:'(mpl-[0-9a-f]+)'", rules))
+
+        def rename(text):
+            for alias in aliases:
+                text = text.replace(alias, alias + tag)
+            return text
+        return rename(rules), [(rename(m), rename(css)) for m, css in probes]
+
     def measure_many(self, items):
         items = [it for it in dict((self.key(m, f), (m, f)) for m, f in items).values()
                  if self.key(*it) not in self._cache]
@@ -425,9 +444,12 @@ class UmbruchServer(UmbruchBridge):
             # @font-face rules apply to the probes of the same request
             rules = _font_face_css((f for _, f in chunk),
                                    math=any("<math" in m for m, _ in chunk))
+            probes = [(m, f["css"]) for m, f in chunk]
+            if rules:
+                rules, probes = self._fresh_aliases(rules, probes)
             head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
             metrics = self.server.measure(head + [
-                {"markup": m, "css": f["css"]} for m, f in chunk])
+                {"markup": m, "css": css} for m, css in probes])
             for (markup, font), m in zip(chunk, metrics[len(head):]):
                 if "error" in m:
                     raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
