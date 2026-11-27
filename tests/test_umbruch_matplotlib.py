@@ -210,17 +210,75 @@ def test_no_fallback_when_the_server_cannot_start(monkeypatch, tmp_path):
     plt.close(fig)
 
 
-def test_wide_colors_replace_painted_colors_only():
-    svg = ('<path fill="#FF0000" stroke="#00ff00"/><g style="color: #ff0000;fill:#0000ff"/>'
-           '<stop stop-color="#ff0000"/><div>#ff0000 in a label</div>')
-    out = hb._apply_wide_colors(svg, {"#ff0000": "color(rec2020 1 0 0)"})
-    assert out.count("color(rec2020 1 0 0)") == 3, out
-    assert 'stroke="#00ff00"' in out and "fill:#0000ff" in out
-    assert "<div>#ff0000 in a label</div>" in out
-    assert hb._apply_wide_colors(svg, {}) == svg
+def test_unknown_color_space_raises():
+    with pytest.raises(ValueError, match="unknown color space"):
+        hb._apply_color_space("<svg/>", "cie-xyz")
 
 
-# -- against the real umbruch ---------------------------------------------------
+def test_color_space_rewrites_painted_colors_only():
+    svg = ('<path fill="#FF0000" stroke="#00ff00" fill-opacity="0.5"/>'
+           '<g style="color: #0000ff;fill:none"/><stop stop-color="#808080"/>'
+           '<div>#ff0000 in a label</div>')
+    out = hb._apply_color_space(svg, "display-p3")
+    assert 'fill="color(display-p3 1 0 0)"' in out
+    assert 'stroke="color(display-p3 0 1 0)"' in out
+    assert "color: color(display-p3 0 0 1);fill:none" in out
+    assert 'stop-color="color(display-p3 0.50196 0.50196 0.50196)"' in out
+    assert "<div>#ff0000 in a label</div>" in out and 'fill-opacity="0.5"' in out
+    assert hb._apply_color_space(svg, None) == svg == hb._apply_color_space(svg, "srgb")
+
+
+def test_color_space_tags_png_images():
+    import base64
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGBA", (2, 2), (0, 255, 0, 255)).save(buf, "PNG")
+    uri = "data:image/png;base64,\n" + base64.b64encode(buf.getvalue()).decode()
+    out = hb._apply_color_space(f'<image xlink:href="{uri}"/>', "display-p3")
+    png = base64.b64decode(re.search(r"base64,\s*([^\"]+)", out).group(1))
+    im = Image.open(io.BytesIO(png))
+    assert im.info["icc_profile"] == hb._icc_profile("display-p3")
+    assert im.size == (2, 2) and im.getpixel((0, 0)) == (0, 255, 0, 255)
+    # a second pass leaves a tagged image alone
+    assert hb._apply_color_space(out, "display-p3") == out.replace(
+        "color(display-p3", "color(display-p3")
+
+
+@pytest.mark.parametrize("space", ["display-p3", "a98-rgb", "prophoto-rgb", "rec2020"])
+def test_icc_profile_agrees_with_convert_color(space):
+    """The profile we write and the numbers we convert with describe the same space
+    (checked through LittleCMS)."""
+    from PIL import Image, ImageCms
+    profile = ImageCms.ImageCmsProfile(io.BytesIO(hb._icc_profile(space)))
+    to_srgb = ImageCms.buildTransform(profile, ImageCms.createProfile("sRGB"),
+                                      "RGB", "RGB", renderingIntent=1)
+    for rgb in [(128, 128, 128), (100, 150, 200), (200, 100, 50), (30, 60, 90)]:
+        got = ImageCms.applyTransform(Image.new("RGB", (1, 1), rgb), to_srgb).getpixel((0, 0))
+        want = np.round(255 * np.array(hb.convert_color(tuple(v / 255 for v in rgb),
+                                                          space, "srgb")[:3]))
+        assert np.abs(np.array(got) - want).max() <= 1, (space, rgb, got, want)
+
+
+def test_convert_color_and_cmap():
+    assert hb.convert_color("white", "srgb", "display-p3")[:3] == pytest.approx((1, 1, 1), abs=1e-6)
+    r, g, b, a = hb.convert_color((0.2, 0.4, 0.6, 0.5), "display-p3", "display-p3")
+    assert (r, g, b, a) == (0.2, 0.4, 0.6, 0.5)
+    # sRGB red is inside Display P3 and a bit less saturated there
+    r, g, b, _ = hb.convert_color("red", "srgb", "display-p3")
+    assert 0.9 < r < 1 and 0.1 < g < 0.3
+    # Display P3 green is outside sRGB: clipped
+    assert hb.convert_color((0, 1, 0), "display-p3", "srgb")[0] == 0
+    cm = hb.convert_cmap("viridis", "srgb", "display-p3", N=16)
+    assert cm.N == 16 and cm.name == "viridis_display-p3"
+    with matplotlib.rc_context():
+        hb.config.color_space, saved = "display-p3", hb.config.color_space
+        try:
+            assert hb.convert_color("red") == hb.convert_color("red", "srgb", "display-p3")
+        finally:
+            hb.config.color_space = saved
+
+
+# -- against the real umbruch# -- against the real umbruch ---------------------------------------------------
 
 @need_umbruch
 def test_metrics_agree_with_matplotlib(real_bridge):
@@ -327,26 +385,35 @@ def test_math_font_in_the_pdf(real_bridge, math_font, tmp_path, font, expect):
 
 
 @need_umbruch
-def test_wide_colors_reach_the_pdf(real_bridge, monkeypatch):
-    monkeypatch.setattr(hb.config, "wide_colors", {"#123456": "color(rec2020 1 0 0)"})
-    fig, ax = plt.subplots()
-    ax.bar([0], [1], color="#123456")
-    plain, wide = io.BytesIO(), io.BytesIO()
-    fig.savefig(wide, format="pdf")
-    monkeypatch.setattr(hb.config, "wide_colors", {})
-    fig.savefig(plain, format="pdf")
-    # a wide color is painted in an ICC space: "/CS1 cs <components> sc"
-    def painted_in_icc_space(pdf):
-        return any(re.search(rb"/CS\d+ cs [\d. ]+ sc", zlib.decompress(m.group(1)))
-                   for m in re.finditer(rb"stream\r?\n(.*?)endstream", pdf, re.S)
-                   if _inflates(m.group(1)))
-    assert painted_in_icc_space(wide.getvalue())
-    assert not painted_in_icc_space(plain.getvalue())
+@pytest.mark.skip(reason="work in progress: needs an umbruch that reads the ICC profile of PNG images")
+@pytest.mark.skipif(not shutil.which("pdftoppm"), reason="needs pdftoppm")
+@pytest.mark.parametrize("space", ["srgb", "display-p3", "rec2020"])
+def test_flat_colors_and_images_agree_in_a_color_space(real_bridge, tmp_path, space):
+    """The same numbers painted flat and as image pixels end up as the same color."""
+    from PIL import Image
+    rgb = (0.1, 0.9, 0.3)
 
+    def pixel(make, name):
+        fig = make()
+        pdf = tmp_path / f"{name}.pdf"
+        fig.savefig(pdf, color_space=space)
+        plt.close(fig)
+        subprocess.run(["pdftoppm", "-r", "20", "-png", "-singlefile", str(pdf),
+                        str(tmp_path / name)], check=True)
+        return np.array(Image.open(tmp_path / f"{name}.png").convert("RGB").getpixel((10, 10)))
 
-def _inflates(data):
-    try:
-        zlib.decompress(data)
-    except zlib.error:
-        return False
-    return True
+    def flat():
+        return plt.figure(figsize=(1, 1), facecolor=rgb)
+
+    def image():
+        fig = plt.figure(figsize=(1, 1))
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis("off")
+        ax.imshow(np.full((8, 8, 3), rgb), interpolation="nearest", aspect="auto")
+        return fig
+
+    a, b = pixel(flat, "flat"), pixel(image, "image")
+    assert np.abs(a - b).max() <= 3, (space, a, b)
+    if space != "srgb":
+        srgb = pixel(lambda: plt.figure(figsize=(1, 1), facecolor=rgb), "srgb")  # in P3 numbers
+        assert np.abs(a - np.array([26, 230, 76])).max() > 10   # not read as sRGB

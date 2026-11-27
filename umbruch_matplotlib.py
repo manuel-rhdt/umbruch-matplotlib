@@ -52,12 +52,14 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import atexit
 import logging
 import struct
 import tempfile
 import threading
+import zlib
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
@@ -177,30 +179,161 @@ class _Config:
     #: file.  None follows ``mathtext.fontset``: "cm" is Latin Modern Math, anything
     #: else STIX Two Math.
     math_font = None
-    #: {"#rrggbb": CSS color}, applied to the SVG just before umbruch renders a PDF.
-    #: Matplotlib only knows sRGB, so a color outside sRGB is plotted as an sRGB
-    #: stand-in and replaced here by its exact CSS Color 4 form (``oklch(...)``,
-    #: ``lab(...)``, ``color(rec2020 ...)``), which umbruch writes as a wide-gamut
-    #: color.  It is replaced where a color is painted (fill, stroke, stop-color,
-    #: color), not in the text of a label.  Every use of the stand-in is replaced, so
-    #: pick one that no sRGB color of the figure shares.
-    wide_colors = {}
+    #: The color space of the numbers Matplotlib works with, one of "srgb" (the
+    #: default), "display-p3", "a98-rgb", "prophoto-rgb" and "rec2020".  Matplotlib
+    #: has no color management, so every RGB value of a figure (colors, colormaps,
+    #: image pixels) is just three numbers in [0, 1]; this says which space they are
+    #: in.  Painted colors are written as CSS ``color(<space> r g b)`` and raster
+    #: images get a matching ICC profile.  ``savefig(..., color_space=...)`` overrides
+    #: it for one file.  Colors given as sRGB (hex, names, the default cycle and
+    #: colormaps) are only right if converted: see ``convert_color``.
+    color_space = None
+
+
+config = _Config()
+
+
+# -- color spaces ----------------------------------------------------------------------
+
+_D50 = np.array([0.9642, 1.0, 0.8249])
+_D65_XY = (0.3127, 0.3290)
+#: primaries (xy), white point (xy) and transfer function ("srgb" or a gamma) of the
+#: predefined spaces of CSS Color 4 (rec2020 as umbruch sets it: a gamma of 2.4)
+_SPACES = {
+    "srgb": ((0.640, 0.330), (0.300, 0.600), (0.150, 0.060), _D65_XY, "srgb"),
+    "display-p3": ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), _D65_XY, "srgb"),
+    "a98-rgb": ((0.640, 0.330), (0.210, 0.710), (0.150, 0.060), _D65_XY, 563 / 256),
+    "prophoto-rgb": ((0.7347, 0.2653), (0.1596, 0.8404), (0.0366, 0.0001),
+                     (0.3457, 0.3585), 1.8),
+    "rec2020": ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), _D65_XY, 2.4),
+}
+_BRADFORD = np.array([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367],
+                      [0.0389, -0.0685, 1.0296]])
+
+
+def _space(name):
+    try:
+        return _SPACES[name]
+    except KeyError:
+        raise ValueError(f"unknown color space {name!r}: one of "
+                         f"{', '.join(_SPACES)}") from None
+
+
+def _xy_to_xyz(xy):
+    x, y = xy
+    return np.array([x / y, 1.0, (1 - x - y) / y])
+
+
+@functools.lru_cache(maxsize=None)
+def _to_xyz_d50(name):
+    """Matrix from linear RGB of *name* to XYZ with a D50 white (the ICC connection space)."""
+    *primaries, white_xy, _ = _space(name)
+    P = np.array([_xy_to_xyz(p) for p in primaries]).T
+    white = _xy_to_xyz(white_xy)
+    M = P * np.linalg.solve(P, white)
+    gain = np.diag((_BRADFORD @ _D50) / (_BRADFORD @ white))
+    return np.linalg.inv(_BRADFORD) @ gain @ _BRADFORD @ M
+
+
+def _decode(v, trc):
+    v = np.asarray(v, dtype=float)
+    a = np.abs(v)
+    lin = np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4) \
+        if trc == "srgb" else a ** trc
+    return np.sign(v) * lin
+
+
+def _encode(v, trc):
+    v = np.asarray(v, dtype=float)
+    a = np.abs(v)
+    enc = np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1 / 2.4) - 0.055) \
+        if trc == "srgb" else a ** (1 / trc)
+    return np.sign(v) * enc
+
+
+def convert_color(color, src="srgb", dst=None):
+    """*color* (any Matplotlib color, or an array of RGB(A) rows) given in the color
+    space *src*, as RGB(A) numbers in *dst* (default: ``config.color_space``), clipped
+    to the gamut of *dst*.  Use it for the colors that Matplotlib supplies as sRGB
+    (names, hex, the default colors) when the figure is in another space."""
+    dst = dst or config.color_space or "srgb"
+    single = isinstance(color, str) or (np.ndim(color) == 1 and len(color) in (3, 4)
+                                        and not isinstance(color[0], str))
+    rgba = mpl.colors.to_rgba_array(color)
+    if src != dst:
+        lin = _decode(rgba[:, :3], _space(src)[4]) @ _to_xyz_d50(src).T
+        out = _encode(np.linalg.solve(_to_xyz_d50(dst), lin.T).T, _space(dst)[4])
+        rgba = np.concatenate([np.clip(out, 0, 1), rgba[:, 3:]], axis=1)
+    return tuple(rgba[0]) if single else rgba
+
+
+def convert_cmap(cmap, src="srgb", dst=None, N=256):
+    """A colormap (a name or a Colormap) whose colors are given in *src*, as a
+    ListedColormap of *N* colors in *dst* (see ``convert_color``)."""
+    cmap = mpl.colormaps[cmap] if isinstance(cmap, str) else cmap
+    colors = convert_color(cmap(np.linspace(0, 1, N)), src, dst)
+    return mpl.colors.ListedColormap(colors, name=f"{cmap.name}_{dst or config.color_space}")
+
+
+def _icc_profile(name):
+    """A matrix/TRC ICC profile (version 2) of the color space *name*."""
+    *_, trc = _space(name)
+    s15 = lambda v: struct.pack(">i", int(round(v * 65536)))
+    xyz = lambda v: b"XYZ \0\0\0\0" + b"".join(s15(c) for c in v)
+    x = np.linspace(0, 1, 1024)
+    curve = b"curv\0\0\0\0" + struct.pack(">I", len(x)) + np.round(
+        _decode(x, trc) * 65535).astype(">u2").tobytes()
+    text = name.encode("ascii") + b"\0"
+    desc = (b"desc\0\0\0\0" + struct.pack(">I", len(text)) + text + b"\0" * 8 + b"\0\0\0"
+            + b"\0" * 67)
+    M = _to_xyz_d50(name)
+    tags = {b"desc": desc, b"cprt": b"text\0\0\0\0" + b"public domain\0",
+            b"wtpt": xyz(_D50), b"rXYZ": xyz(M[:, 0]), b"gXYZ": xyz(M[:, 1]),
+            b"bXYZ": xyz(M[:, 2]), b"rTRC": curve, b"gTRC": curve, b"bTRC": curve}
+    offset = 128 + 4 + 12 * len(tags)
+    table, body = b"", b""
+    for sig, data in tags.items():
+        data += b"\0" * (-len(data) % 4)
+        table += sig + struct.pack(">II", offset + len(body), len(data))
+        body += data
+    size = offset + len(body)
+    header = (struct.pack(">I", size) + b"\0\0\0\0" + b"\x02\x40\x00\x00" + b"mntrRGB XYZ "
+              + b"\x07\xea\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00" + b"acsp" + b"\0" * 24
+              + b"\0\0\0\0" + b"".join(s15(c) for c in _D50) + b"\0" * 4 + b"\0" * 16
+              + b"\0" * 28)
+    return header + struct.pack(">I", len(tags)) + table + body
 
 
 # only where a color is painted (fill="#..", style="fill: #..", color: #..), not in the text
 # of a label
 _HEX = re.compile(r"((?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*[\"']?\s*)"
                   r"(#[0-9a-fA-F]{6})\b")
+_PNG_URI = re.compile(r"(data:image/png;base64,\s*)([A-Za-z0-9+/=\s]+)")
 
 
-def _apply_wide_colors(svg, mapping):
-    if not mapping:
+def _png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(
+        ">I", zlib.crc32(kind + data))
+
+
+def _apply_color_space(svg, space):
+    """Say that the numbers of *svg* are in *space*: painted hex colors become
+    ``color(space r g b)``, and PNG images get the ICC profile of the space."""
+    if space in (None, "srgb"):
         return svg
-    lut = {k.lower(): v for k, v in mapping.items()}
-    return _HEX.sub(lambda m: m.group(1) + lut.get(m.group(2).lower(), m.group(2)), svg)
+    _space(space)
+    css = lambda m: m.group(1) + "color({} {})".format(space, " ".join(
+        f"{int(m.group(2)[i:i + 2], 16) / 255:.5g}" for i in (1, 3, 5)))
+    svg = _HEX.sub(css, svg)
+    iccp = _png_chunk(b"iCCP", space.encode() + b"\0\0" + zlib.compress(_icc_profile(space)))
 
-
-config = _Config()
+    def tag(m):
+        png = base64.b64decode(m.group(2))
+        end = 8 + 12 + 13        # the signature and the IHDR chunk
+        if png[:8] != b"\x89PNG\r\n\x1a\n" or b"iCCP" in png[:end + 64]:
+            return m.group(0)
+        return m.group(1) + base64.b64encode(png[:end] + iccp + png[end:]).decode("ascii")
+    return _PNG_URI.sub(tag, svg)
 
 
 class UmbruchBridge:
@@ -862,23 +995,29 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
                 return
             bridge.measure_many(list(pending.values()))
 
+    def _svg_text(self, bridge, bbox_inches_restore, metadata, color_space):
+        buf = io.StringIO()
+        size = self._draw_to(buf, bridge, bbox_inches_restore, metadata)
+        space = color_space or config.color_space
+        return _apply_color_space(buf.getvalue(), space), size
+
     def print_svg(self, filename, *, bbox_inches_restore=None, metadata=None,
-                  **kwargs):
+                  color_space=None, **kwargs):
         bridge = get_bridge()
         self._prefetch(bridge)
+        text, _ = self._svg_text(bridge, bbox_inches_restore, metadata, color_space)
         with cbook.open_file_cm(filename, "w", encoding="utf-8") as fh:
             if not cbook.file_requires_unicode(fh):
                 import codecs
                 fh = codecs.getwriter("utf-8")(fh)
-            self._draw_to(fh, bridge, bbox_inches_restore, metadata)
+            fh.write(text)
 
     def print_pdf(self, filename, *, bbox_inches_restore=None, metadata=None,
-                  **kwargs):
+                  color_space=None, **kwargs):
         bridge = get_bridge()
         self._prefetch(bridge)
-        buf = io.StringIO()
-        w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
-        data = bridge.render(_apply_wide_colors(buf.getvalue(), config.wide_colors), w, h)
+        svg, (w, h) = self._svg_text(bridge, bbox_inches_restore, None, color_space)
+        data = bridge.render(svg, w, h)
         with cbook.open_file_cm(filename, "wb") as fh:
             fh.write(data)
 
