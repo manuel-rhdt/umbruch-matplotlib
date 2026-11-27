@@ -17,8 +17,9 @@ differ from stock SVG output:
 * Gouraud triangles (``config.gouraud == "native"``, the default) are one compact
   ``<g data-umbruch-mesh="gouraud" data-vertices=... data-triangles=...>`` element, which
   umbruch paints as a single type 4 shading.  This is an umbruch extension of SVG that no
-  other renderer draws.  ``"subdivide"`` (flat sub-triangles) and ``"stock"``
-  (Matplotlib's gradient emulation) are polyfills for other renderers.
+  other renderer draws, and it needs one alpha per mesh.  ``"subdivide"`` (flat
+  sub-triangles) and ``"stock"`` (Matplotlib's gradient emulation) are polyfills for
+  other renderers.  None works in a wide color space yet: that raises.
 * Fonts: the file that Matplotlib's font manager picks for each text is sent to
   umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
   under a name derived from the file; the font's own family list follows as fallback.
@@ -50,28 +51,47 @@ import base64
 import functools
 import hashlib
 import io
-import json
 import os
 import re
-import shutil
-import subprocess
-import atexit
 import logging
 import struct
-import tempfile
-import threading
+import zlib
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 import numpy as np
 
+import umbruch
+
 import matplotlib as mpl
 from matplotlib import cbook, font_manager as fm
 from matplotlib.backend_bases import FigureManagerBase
 from matplotlib.backends.backend_mixed import MixedModeRenderer
-from matplotlib.backends.backend_svg import (
-    FigureCanvasSVG, RendererSVG, _XMLWriter)
+from matplotlib.backends import backend_svg as _backend_svg
+from matplotlib.backends.backend_svg import FigureCanvasSVG, RendererSVG
+
+# This backend builds on parts of Matplotlib's SVG backend that are not public API.
+# Before 3.11 the XML writer is called XMLWriter; check the rest, so that a Matplotlib
+# that changed them fails here with a message rather than somewhere in a drawing.
+_XMLWriter = getattr(_backend_svg, "_XMLWriter", None) or _backend_svg.XMLWriter
+_generate_css = getattr(_backend_svg, "_generate_css", None)
+_PRIVATE = {
+    "RendererSVG": [(RendererSVG, n) for n in (
+        "_get_clip_attrs", "_make_flip_transform", "_convert_path", "_get_style_dict",
+        "_write_hatches", "_get_hatch", "_make_id", "draw_gouraud_triangles")],
+    "the XML writer": [(_XMLWriter, n) for n in (
+        "_XMLWriter__flush", "start", "end", "element", "data")],
+    "backend_svg": [(_backend_svg, "_generate_css")],
+}
+_missing = [f"{where}.{name}" for where, items in _PRIVATE.items()
+            for obj, name in items if not hasattr(obj, name)]
+if _missing:
+    raise ImportError(
+        f"umbruch_matplotlib needs parts of Matplotlib's SVG backend that Matplotlib "
+        f"{mpl.__version__} does not have ({', '.join(_missing)}); it is tested with "
+        "Matplotlib 3.9 to 3.11")
 from matplotlib.colors import rgb2hex
+from matplotlib.transforms import Affine2D
 
 log = logging.getLogger(__name__)
 
@@ -163,7 +183,7 @@ def _default_tex_to_mathml(tex):
 
 class _Config:
     #: UmbruchBridge instance; if None, one is created for the umbruch executable
-    #: found by ``find_umbruch``.
+    #: found by ``umbruch.Server``.
     bridge = None
     #: callable(tex: str) -> MathML string, or None to use latex2mathml (an error
     #: if that is not installed).
@@ -171,10 +191,11 @@ class _Config:
     #: "native" (default): the mesh is one compact ``<g data-umbruch-mesh="gouraud">``
     #: element that umbruch writes as a single type 4 shading.  This is an umbruch
     #: extension of SVG and nothing else draws it; it needs an umbruch that reports
-    #: the mesh_gouraud capability.  The alternatives are polyfills for other
-    #: renderers: "subdivide": flat sub-triangles (works with any renderer);
-    #: "stock": Matplotlib's three-gradient filter emulation; "auto": "native" if the
-    #: renderer reports mesh_gouraud, else "subdivide".
+    #: the mesh_gouraud capability, and one alpha for the whole mesh (otherwise it
+    #: raises).  The alternatives are polyfills for other renderers: "subdivide": flat
+    #: sub-triangles (works with any renderer); "stock": Matplotlib's three-gradient
+    #: filter emulation; "auto": "native" if that is possible, else "subdivide".  None
+    #: of them works in a wide ``color_space`` yet (umbruch paints meshes in sRGB).
     gouraud = "native"
     gouraud_max_level = 8
     #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
@@ -182,9 +203,146 @@ class _Config:
     #: file.  None follows ``mathtext.fontset``: "cm" is Latin Modern Math, anything
     #: else STIX Two Math.
     math_font = None
+    #: The color space of the numbers Matplotlib works with, one of "srgb" (the
+    #: default), "display-p3", "a98-rgb", "prophoto-rgb" and "rec2020".  Matplotlib
+    #: has no color management, so every RGB value of a figure (colors, colormaps,
+    #: image pixels) is just three numbers in [0, 1]; this says which space they are
+    #: in.  Painted colors are written as CSS ``color(<space> r g b)`` and raster
+    #: images get a matching ICC profile.  ``savefig(..., color_space=...)`` overrides
+    #: it for one file.  Colors given as sRGB (hex, names, the default cycle and
+    #: colormaps) are only right if converted: see ``convert_color``.
+    color_space = None
 
 
 config = _Config()
+
+
+# -- color spaces ----------------------------------------------------------------------
+
+_D50 = np.array([0.9642, 1.0, 0.8249])
+_D65_XY = (0.3127, 0.3290)
+#: primaries (xy), white point (xy) and transfer function ("srgb" or a gamma) of the
+#: predefined spaces of CSS Color 4 (rec2020 as umbruch sets it: a gamma of 2.4)
+_SPACES = {
+    "srgb": ((0.640, 0.330), (0.300, 0.600), (0.150, 0.060), _D65_XY, "srgb"),
+    "display-p3": ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), _D65_XY, "srgb"),
+    "a98-rgb": ((0.640, 0.330), (0.210, 0.710), (0.150, 0.060), _D65_XY, 563 / 256),
+    "prophoto-rgb": ((0.7347, 0.2653), (0.1596, 0.8404), (0.0366, 0.0001),
+                     (0.3457, 0.3585), 1.8),
+    "rec2020": ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), _D65_XY, 2.4),
+}
+_BRADFORD = np.array([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367],
+                      [0.0389, -0.0685, 1.0296]])
+
+
+def _space(name):
+    try:
+        return _SPACES[name]
+    except KeyError:
+        raise ValueError(f"unknown color space {name!r}: one of "
+                         f"{', '.join(_SPACES)}") from None
+
+
+def _xy_to_xyz(xy):
+    x, y = xy
+    return np.array([x / y, 1.0, (1 - x - y) / y])
+
+
+@functools.lru_cache(maxsize=None)
+def _to_xyz_d50(name):
+    """Matrix from linear RGB of *name* to XYZ with a D50 white (the ICC connection space)."""
+    *primaries, white_xy, _ = _space(name)
+    P = np.array([_xy_to_xyz(p) for p in primaries]).T
+    white = _xy_to_xyz(white_xy)
+    M = P * np.linalg.solve(P, white)
+    gain = np.diag((_BRADFORD @ _D50) / (_BRADFORD @ white))
+    return np.linalg.inv(_BRADFORD) @ gain @ _BRADFORD @ M
+
+
+def _decode(v, trc):
+    v = np.asarray(v, dtype=float)
+    a = np.abs(v)
+    lin = np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4) \
+        if trc == "srgb" else a ** trc
+    return np.sign(v) * lin
+
+
+def _encode(v, trc):
+    v = np.asarray(v, dtype=float)
+    a = np.abs(v)
+    enc = np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1 / 2.4) - 0.055) \
+        if trc == "srgb" else a ** (1 / trc)
+    return np.sign(v) * enc
+
+
+def convert_color(color, src="srgb", dst=None):
+    """*color* (any Matplotlib color, or an array of RGB(A) rows) given in the color
+    space *src*, as RGB(A) numbers in *dst* (default: ``config.color_space``), clipped
+    to the gamut of *dst*.  Use it for the colors that Matplotlib supplies as sRGB
+    (names, hex, the default colors) when the figure is in another space."""
+    dst = dst or config.color_space or "srgb"
+    single = isinstance(color, str) or (np.ndim(color) == 1 and len(color) in (3, 4)
+                                        and not isinstance(color[0], str))
+    rgba = mpl.colors.to_rgba_array(color)
+    if src != dst:
+        lin = _decode(rgba[:, :3], _space(src)[4]) @ _to_xyz_d50(src).T
+        out = _encode(np.linalg.solve(_to_xyz_d50(dst), lin.T).T, _space(dst)[4])
+        rgba = np.concatenate([np.clip(out, 0, 1), rgba[:, 3:]], axis=1)
+    return tuple(rgba[0]) if single else rgba
+
+
+def convert_cmap(cmap, src="srgb", dst=None, N=256):
+    """A colormap (a name or a Colormap) whose colors are given in *src*, as a
+    ListedColormap of *N* colors in *dst* (see ``convert_color``)."""
+    cmap = mpl.colormaps[cmap] if isinstance(cmap, str) else cmap
+    colors = convert_color(cmap(np.linspace(0, 1, N)), src, dst)
+    return mpl.colors.ListedColormap(colors, name=f"{cmap.name}_{dst or config.color_space}")
+
+
+def _icc_profile(name):
+    """A matrix/TRC ICC profile (version 2) of the color space *name*."""
+    *_, trc = _space(name)
+    s15 = lambda v: struct.pack(">i", int(round(v * 65536)))
+    xyz = lambda v: b"XYZ \0\0\0\0" + b"".join(s15(c) for c in v)
+    x = np.linspace(0, 1, 1024)
+    curve = b"curv\0\0\0\0" + struct.pack(">I", len(x)) + np.round(
+        _decode(x, trc) * 65535).astype(">u2").tobytes()
+    text = name.encode("ascii") + b"\0"
+    desc = (b"desc\0\0\0\0" + struct.pack(">I", len(text)) + text + b"\0" * 8 + b"\0\0\0"
+            + b"\0" * 67)
+    M = _to_xyz_d50(name)
+    tags = {b"desc": desc, b"cprt": b"text\0\0\0\0" + b"public domain\0",
+            b"wtpt": xyz(_D50), b"rXYZ": xyz(M[:, 0]), b"gXYZ": xyz(M[:, 1]),
+            b"bXYZ": xyz(M[:, 2]), b"rTRC": curve, b"gTRC": curve, b"bTRC": curve}
+    offset = 128 + 4 + 12 * len(tags)
+    table, body = b"", b""
+    for sig, data in tags.items():
+        data += b"\0" * (-len(data) % 4)
+        table += sig + struct.pack(">II", offset + len(body), len(data))
+        body += data
+    size = offset + len(body)
+    header = (struct.pack(">I", size) + b"\0\0\0\0" + b"\x02\x40\x00\x00" + b"mntrRGB XYZ "
+              + b"\x07\xea\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00" + b"acsp" + b"\0" * 24
+              + b"\0\0\0\0" + b"".join(s15(c) for c in _D50) + b"\0" * 4 + b"\0" * 16
+              + b"\0" * 28)
+    return header + struct.pack(">I", len(tags)) + table + body
+
+
+def _png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(
+        ">I", zlib.crc32(kind + data))
+
+
+def _tag_png_uri(uri, space):
+    """The ``data:image/png;base64,...`` URI *uri* with the ICC profile of *space* in
+    the PNG (after the IHDR chunk), unless it has one already."""
+    head, _, data = uri.partition("base64,")
+    png = base64.b64decode(data)
+    end = 8 + 12 + 13        # the signature and the IHDR chunk
+    if png[:8] != b"\x89PNG\r\n\x1a\n" or b"iCCP" in png[:end + 64]:
+        return uri
+    iccp = _png_chunk(b"iCCP", space.encode() + b"\0\0" + zlib.compress(_icc_profile(space)))
+    return head + "base64," + base64.b64encode(png[:end] + iccp + png[end:]).decode("ascii")
 
 
 class UmbruchBridge:
@@ -242,118 +400,22 @@ class UmbruchBridge:
 
 
 class UmbruchServer(UmbruchBridge):
-    """Bridge to one long-lived ``umbruch --serve`` process (protocol version 1).
+    """The bridge to umbruch: an ``umbruch.Server`` (one long-lived ``umbruch --serve``
+    process; the executable is ``$UMBRUCH``, the one installed with the package or the
+    one on PATH).  It sees only the fonts built into umbruch, so that the output does
+    not depend on the machine: the fonts of the text are sent along as @font-face.
+    ``umbruch.Error`` is raised if it cannot be found or started."""
 
-    Measuring and rendering are requests over stdio, framed as in LSP.  ``measure``
-    returns baseline, line box, advance width and ink bounds, so Matplotlib is told
-    the ink extents directly; the line box is only used to place the text.  A server
-    that exited (panic, timeout) is started again and the idempotent request is
-    repeated once.
-    """
-
-    PROTOCOL = 1
     BATCH = 2000
 
-    def __init__(self, executable="umbruch", args=("--no-system-fonts",)):
+    def __init__(self, server=None):
         super().__init__()
-        self.executable = executable
-        self.args = list(args)
-        self._proc = None
-        self._lock = threading.RLock()
-        self._next_id = 0
-        self._pid = None
-        atexit.register(self.close)
-
-    # -- process and framing -------------------------------------------------
-
-    def _start(self):
-        self._proc = subprocess.Popen(
-            [self.executable, *self.args, "--serve"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE)
-        try:
-            hello, _ = self._exchange("hello", {"protocol": self.PROTOCOL})
-        except Exception:
-            self._kill()
-            raise
-        if hello.get("protocol") != self.PROTOCOL:
-            self._kill()
-            raise RuntimeError(f"umbruch speaks protocol {hello.get('protocol')}, "
-                               f"expected {self.PROTOCOL}")
-        self.capabilities = frozenset(hello.get("capabilities", ()))
+        self.server = server or umbruch.Server(system_fonts=False)
+        self.server.measure([])          # starts the process now, so that errors surface here
+        self.capabilities = self.server.capabilities
         missing = {"measure", "render"} - self.capabilities
         if missing:
-            self._kill()
-            raise RuntimeError(f"umbruch --serve lacks {sorted(missing)}")
-        self.version = hello.get("umbruch")
-        self._pid = os.getpid()
-
-    def _kill(self):
-        p, self._proc = self._proc, None
-        if p is not None:
-            try:
-                p.kill()
-            except OSError:
-                pass
-            p.wait()
-
-    def _read_exact(self, n):
-        data = self._proc.stdout.read(n)
-        if len(data) != n:
-            raise EOFError("umbruch server closed the stream")
-        return data
-
-    def _exchange(self, op, params):
-        self._next_id += 1
-        body = json.dumps({"id": self._next_id, "op": op, "params": params},
-                          ensure_ascii=False).encode("utf-8")
-        self._proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
-        self._proc.stdin.flush()
-        length = None
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:
-                raise EOFError("umbruch server closed the stream")
-            line = line.strip()
-            if not line:
-                break
-            name, _, value = line.decode("ascii", "replace").partition(":")
-            if name.lower() == "content-length":
-                length = int(value)
-        if length is None:
-            raise RuntimeError("umbruch server sent a frame without Content-Length")
-        reply = json.loads(self._read_exact(length))
-        if reply.get("id") != self._next_id:
-            raise RuntimeError(f"umbruch server answered request {reply.get('id')}, "
-                               f"expected {self._next_id}")
-        if not reply.get("ok"):
-            e = reply.get("error", {})
-            raise RuntimeError(f"umbruch {op} failed: {e.get('code')}: {e.get('message')}")
-        result = reply["result"]
-        attachment = self._read_exact(result["attachment_length"]) \
-            if result.get("attachment_length") else b""
-        return result, attachment
-
-    def request(self, op, params):
-        with self._lock:
-            if self._proc is not None and self._pid != os.getpid():
-                # forked child: the pipes belong to the parent's conversation
-                for f in (self._proc.stdin, self._proc.stdout):
-                    try:
-                        f.close()
-                    except OSError:
-                        pass
-                self._proc = None
-            for attempt in (0, 1):
-                try:
-                    if self._proc is None or self._proc.poll() is not None:
-                        self._start()
-                    return self._exchange(op, params)
-                except (EOFError, BrokenPipeError, OSError):
-                    self._kill()
-                    if attempt:
-                        raise RuntimeError("the umbruch server keeps exiting") from None
-
-    # -- bridge --------------------------------------------------------------
+            raise umbruch.Error("server", f"umbruch --serve lacks {sorted(missing)}")
 
     def measure_many(self, items):
         items = [it for it in dict((self.key(m, f), (m, f)) for m, f in items).values()
@@ -364,9 +426,9 @@ class UmbruchServer(UmbruchBridge):
             rules = _font_face_css((f for _, f in chunk),
                                    math=any("<math" in m for m, _ in chunk))
             head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
-            result, _ = self.request("measure", {"probes": head + [
-                {"markup": m, "css": f["css"]} for m, f in chunk]})
-            for (markup, font), m in zip(chunk, result["metrics"][len(head):]):
+            metrics = self.server.measure(head + [
+                {"markup": m, "css": f["css"]} for m, f in chunk])
+            for (markup, font), m in zip(chunk, metrics[len(head):]):
                 if "error" in m:
                     raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
                 ink = m["ink"]
@@ -383,57 +445,21 @@ class UmbruchServer(UmbruchBridge):
                                 markup[:40])
 
     def render(self, svg, width, height):
-        result, pdf = self.request("render", {
-            "document": {"source": svg, "kind": "xml"}, "options": {}})
-        for w in result.get("warnings", ()):
-            if "no `lang`" not in str(w):  # PDF/UA is not a goal of a plot
+        rendered = umbruch.HTML(svg, xml=True, server=self.server).render()
+        for w in rendered.warnings:
+            if "PDF/UA" not in str(w):  # not a goal of a plot
                 log.warning("umbruch: %s", w)
-        return pdf
+        return rendered.pdf
 
     def close(self):
-        with self._lock:
-            p, self._proc = self._proc, None
-        if p is None:
-            return
-        try:
-            self._proc = p
-            self._exchange("shutdown", {})
-        except Exception:
-            pass
-        finally:
-            self._proc = None
-            try:
-                p.stdin.close()
-                p.wait(timeout=5)
-            except Exception:
-                p.kill()
-
-
-def find_umbruch():
-    """The umbruch executable: $UMBRUCH, the one installed with the ``umbruch`` package,
-    or ``umbruch`` on PATH."""
-    exe = os.environ.get("UMBRUCH")
-    if exe:
-        return exe
-    try:
-        import umbruch
-        exe = umbruch.find_umbruch()
-    except ImportError:
-        exe = None
-    return exe or shutil.which("umbruch")
+        self.server.close()
 
 
 def get_bridge():
-    """The bridge to the umbruch server (started on first use).  There is no fallback to
-    another way of running umbruch: if it cannot be found or started, this raises."""
+    """The bridge to umbruch (started on first use); raises ``umbruch.Error`` if umbruch
+    cannot be found or started.  There is no fallback to another way of running it."""
     if config.bridge is None:
-        exe = find_umbruch()
-        if exe is None:
-            raise RuntimeError("umbruch executable not found: pip install umbruch, put it on "
-                               "PATH, or set $UMBRUCH (or umbruch_matplotlib.config.bridge)")
-        server = UmbruchServer(exe)
-        server._start()
-        config.bridge = server
+        config.bridge = UmbruchServer()
     return config.bridge
 
 
@@ -646,6 +672,16 @@ def _check_xml(fragment):
 
 
 class _RawWriter(_XMLWriter):
+    #: the color space of the figure: PNG images are written with its ICC profile
+    color_space = None
+
+    def element(self, tag, text="", attrib={}, **extra):
+        href = attrib.get("xlink:href", "")
+        if tag == "image" and self.color_space not in (None, "srgb") \
+                and href.startswith("data:image/png;base64,"):
+            attrib = {**attrib, "xlink:href": _tag_png_uri(href, self.color_space)}
+        super().element(tag, text, attrib, **extra)
+
     def raw(self, s):
         # Pretty-printing would insert whitespace between inline elements.
         self._XMLWriter__flush()
@@ -654,13 +690,62 @@ class _RawWriter(_XMLWriter):
 
 class RendererUmbruch(RendererSVG):
     def __init__(self, width, height, svgwriter, basename=None, image_dpi=72,
-                 *, metadata=None, bridge):
+                 *, metadata=None, bridge, color_space=None):
         super().__init__(width, height, svgwriter, basename, image_dpi,
                          metadata=metadata)
         self.writer.__class__ = _RawWriter
         self.bridge = bridge
+        self.color_space = color_space
+        self.writer.color_space = color_space
         self._fonts = {}
         self._math = False
+
+    # -- colors -------------------------------------------------------------
+
+    def _css_color(self, rgb):
+        """*rgb* as a CSS color: in the figure's color space at full precision (stock
+        SVG writes hex, which rounds to 1/255), or as hex for sRGB."""
+        if self.color_space in (None, "srgb"):
+            return rgb2hex(rgb)
+        return "color({} {})".format(self.color_space,
+                                     " ".join(f"{float(v):.6g}" for v in rgb[:3]))
+
+    def _get_style_dict(self, gc, rgbFace):
+        attrib = super()._get_style_dict(gc, rgbFace)
+        if self.color_space not in (None, "srgb"):
+            if attrib.get("fill", "").startswith("#"):
+                attrib["fill"] = self._css_color(rgbFace)
+            if attrib.get("stroke", "").startswith("#"):
+                attrib["stroke"] = self._css_color(gc.get_rgb())
+        return attrib
+
+    def _write_hatches(self):
+        """As stock SVG, with the colors of the pattern in the figure's color space."""
+        if self.color_space in (None, "srgb"):
+            return super()._write_hatches()
+        if not len(self._hatchd):
+            return
+        size = 72
+        wr = self.writer
+        wr.start("defs")
+        for (path, face, stroke, *lw), oid in self._hatchd.values():
+            # the line width is part of the key since Matplotlib 3.11
+            lw = lw[0] if lw else mpl.rcParams["hatch.linewidth"]
+            wr.start("pattern", id=oid, patternUnits="userSpaceOnUse", x="0", y="0",
+                     width=str(size), height=str(size))
+            path_data = self._convert_path(
+                path, Affine2D().scale(size).scale(1.0, -1.0).translate(0, size),
+                simplify=False)
+            wr.element("rect", x="0", y="0", width=str(size + 1), height=str(size + 1),
+                       fill="none" if face is None else self._css_color(face))
+            style = {"fill": self._css_color(stroke), "stroke": self._css_color(stroke),
+                     "stroke-width": str(lw), "stroke-linecap": "butt",
+                     "stroke-linejoin": "miter"}
+            if stroke[3] < 1:
+                style["stroke-opacity"] = str(stroke[3])
+            wr.element("path", d=path_data, style=_generate_css(style))
+            wr.end("pattern")
+        wr.end("defs")
 
     # -- text ---------------------------------------------------------------
 
@@ -714,7 +799,7 @@ class RendererUmbruch(RendererSVG):
         pad = 0.25 * font["size"]
         style = (f"margin:{_fmt(pad)}px 0 0 {_fmt(pad)}px;padding:0;"
                  f"white-space:pre;line-height:normal;"
-                 f"{font['css']};color:{rgb2hex(gc.get_rgb())}")
+                 f"{font['css']};color:{self._css_color(gc.get_rgb())}")
         if alpha != 1:
             style += f";opacity:{_fmt(alpha)}"
         div = f'<div xmlns="{XHTML}" style="{style}">{markup}</div>'
@@ -749,8 +834,14 @@ class RendererUmbruch(RendererSVG):
 
     def draw_gouraud_triangles(self, gc, triangles_array, colors_array, transform):
         mode = config.gouraud
-        if mode == "auto":
-            mode = "native" if "mesh_gouraud" in self.bridge.capabilities else "subdivide"
+        if mode not in ("native", "auto", "subdivide", "stock"):
+            raise ValueError(f"config.gouraud must be 'native', 'auto', 'subdivide' or "
+                             f"'stock', not {mode!r}")
+        if self.color_space not in (None, "srgb"):
+            raise NotImplementedError(
+                f"Gouraud shading is not supported in the {self.color_space} color space "
+                "yet (umbruch paints meshes in sRGB): use shading='flat' or 'nearest', "
+                "or color_space='srgb'")
         if mode == "stock":
             return super().draw_gouraud_triangles(gc, triangles_array, colors_array,
                                                   transform)
@@ -759,15 +850,26 @@ class RendererUmbruch(RendererSVG):
             log.warning("this umbruch lacks the mesh_gouraud capability: its Gouraud "
                         "meshes are not drawn; update umbruch or set "
                         "config.gouraud = 'subdivide'")
-        wr = self.writer
-        trans = self._make_flip_transform(transform.frozen())
         cols = np.asarray(colors_array, dtype=float)
         if cols.shape[-1] == 1:
             cols = np.repeat(cols, 3, axis=-1)
         if cols.shape[-1] == 3:
             cols = np.concatenate([cols, np.ones(cols.shape[:-1] + (1,))], axis=-1)
+        # umbruch paints a mesh as one shading, which has one alpha
+        problem = None
+        if mode == "auto" and "mesh_gouraud" not in self.bridge.capabilities:
+            problem = "this umbruch cannot paint meshes"
+        elif np.ptp(cols[..., 3]) > 1 / 512:
+            problem = "the alpha changes between the vertices"
+        if mode == "native" and problem:
+            raise ValueError(f"config.gouraud = 'native' is not possible: {problem}; "
+                             "use config.gouraud = 'subdivide'")
+        native = mode == "native" or (mode == "auto" and not problem)
+
+        wr = self.writer
+        trans = self._make_flip_transform(transform.frozen())
         wr.start("g", **self._get_clip_attrs(gc))
-        if mode == "native":
+        if native:
             self._native_mesh(trans, np.asarray(triangles_array, dtype=float), cols)
         else:
             wr.start("g")
@@ -790,18 +892,18 @@ class RendererUmbruch(RendererSVG):
             "data-vertices": " ".join(map(repr, vertices.ravel().tolist())),
             "data-triangles": " ".join(map(str, index.ravel().tolist()))})
 
-    def _tri(self, p, rgba, extra=None, seam=False):
-        attrib = {"fill-opacity": _fmt(rgba[3]), **(extra or {})}
+    def _tri(self, p, rgba, seam=False):
+        attrib = {"fill-opacity": _fmt(rgba[3])}
         if seam and rgba[3] >= 1:
             # a hairline of the same color hides the seams that antialiasing leaves
             # between flat neighbours
-            attrib.update({"stroke": rgb2hex(rgba[:3]), "stroke-width": "0.4",
+            attrib.update({"stroke": self._css_color(rgba[:3]), "stroke-width": "0.4",
                            "stroke-linejoin": "round"})
         else:
             attrib["stroke"] = "none"
         self.writer.element(
             "path", d="M{} {}L{} {}L{} {}Z".format(*(_fmt(v) for v in p.ravel())),
-            fill=rgb2hex(rgba[:3]), attrib=attrib)
+            fill=self._css_color(rgba[:3]), attrib=attrib)
 
     def _subdivided(self, p, c):
         """Approximate a Gouraud triangle by flat ones: n*n sub-triangles, each in the
@@ -836,14 +938,15 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def get_default_filetype(self):
         return "pdf"
 
-    def _draw_to(self, fh, bridge, bbox_inches_restore, metadata):
+    def _draw_to(self, fh, bridge, bbox_inches_restore, metadata, color_space=None):
         dpi = self.figure.dpi
         self.figure.dpi = 72
         width, height = self.figure.get_size_inches()
         w, h = width * 72, height * 72
         renderer = MixedModeRenderer(
             self.figure, width, height, dpi,
-            RendererUmbruch(w, h, fh, image_dpi=dpi, metadata=metadata, bridge=bridge),
+            RendererUmbruch(w, h, fh, image_dpi=dpi, metadata=metadata, bridge=bridge,
+                            color_space=color_space),
             bbox_inches_restore=bbox_inches_restore)
         self.figure.draw(renderer)
         renderer.finalize()
@@ -862,23 +965,31 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
                 return
             bridge.measure_many(list(pending.values()))
 
+    def _svg_text(self, bridge, bbox_inches_restore, metadata, color_space):
+        space = color_space or config.color_space
+        if space is not None:
+            _space(space)
+        buf = io.StringIO()
+        size = self._draw_to(buf, bridge, bbox_inches_restore, metadata, space)
+        return buf.getvalue(), size
+
     def print_svg(self, filename, *, bbox_inches_restore=None, metadata=None,
-                  **kwargs):
+                  color_space=None, **kwargs):
         bridge = get_bridge()
         self._prefetch(bridge)
+        text, _ = self._svg_text(bridge, bbox_inches_restore, metadata, color_space)
         with cbook.open_file_cm(filename, "w", encoding="utf-8") as fh:
             if not cbook.file_requires_unicode(fh):
                 import codecs
                 fh = codecs.getwriter("utf-8")(fh)
-            self._draw_to(fh, bridge, bbox_inches_restore, metadata)
+            fh.write(text)
 
     def print_pdf(self, filename, *, bbox_inches_restore=None, metadata=None,
-                  **kwargs):
+                  color_space=None, **kwargs):
         bridge = get_bridge()
         self._prefetch(bridge)
-        buf = io.StringIO()
-        w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
-        data = bridge.render(buf.getvalue(), w, h)
+        svg, (w, h) = self._svg_text(bridge, bbox_inches_restore, None, color_space)
+        data = bridge.render(svg, w, h)
         with cbook.open_file_cm(filename, "wb") as fh:
             fh.write(data)
 
