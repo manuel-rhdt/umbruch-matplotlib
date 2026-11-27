@@ -14,9 +14,10 @@ differ from stock SVG output:
   plain text, as with stock Matplotlib, plus what markup adds to the line box
   (sub/superscripts, fractions); the line box itself is used only to place the
   text on its baseline.
-* Gouraud triangles are drawn as flat sub-triangles (``config.gouraud ==
-  "subdivide"``) because umbruch does not read mesh shadings from SVG yet.
-  ``"native"`` writes exact vertex colors for a renderer that does.
+* Gouraud triangles are written as a ``data-umbruch-mesh`` group (compact form: shared
+  vertices and triangle indices) that umbruch paints as one type 4 shading.  That
+  needs sRGB and one alpha per mesh; otherwise (or with ``config.gouraud ==
+  "subdivide"``) they are drawn as flat sub-triangles.
 * Fonts: the file that Matplotlib's font manager picks for each text is sent to
   umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
   under a name derived from the file; the font's own family list follows as fallback.
@@ -48,22 +49,17 @@ import base64
 import functools
 import hashlib
 import io
-import json
 import os
 import re
-import shutil
-import struct
-import subprocess
-import atexit
 import logging
 import struct
-import tempfile
-import threading
 import zlib
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 import numpy as np
+
+import umbruch
 
 import matplotlib as mpl
 from matplotlib import cbook, font_manager as fm
@@ -185,15 +181,15 @@ def _default_tex_to_mathml(tex):
 
 class _Config:
     #: UmbruchBridge instance; if None, one is created for the umbruch executable
-    #: found by ``find_umbruch``.
+    #: found by ``umbruch.Server``.
     bridge = None
     #: callable(tex: str) -> MathML string, or None to use latex2mathml (an error
     #: if that is not installed).
     tex_to_mathml = None
-    #: "auto": "native" if the renderer reports the mesh_gouraud capability, else
-    #: "subdivide"; "subdivide": flat sub-triangles (works with any renderer);
-    #: "native": exact vertex colors in data-colors, for a renderer that writes a
-    #: type 4 shading.
+    #: "auto": "native" (a mesh shading, umbruch's ``data-umbruch-mesh``) when the figure
+    #: is in sRGB and the alpha is the same at all vertices, else "subdivide" (flat
+    #: sub-triangles); "native" and "subdivide" insist on one of them, "native" raising
+    #: if it is not possible.
     gouraud = "auto"
     gouraud_max_level = 8
     #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
@@ -398,118 +394,35 @@ class UmbruchBridge:
 
 
 class UmbruchServer(UmbruchBridge):
-    """Bridge to one long-lived ``umbruch --serve`` process (protocol version 1).
+    """The bridge to umbruch: an ``umbruch.Server`` (one long-lived ``umbruch --serve``
+    process; the executable is ``$UMBRUCH``, the one installed with the package or the
+    one on PATH).  It sees only the fonts built into umbruch, so that the output does
+    not depend on the machine: the fonts of the text are sent along as @font-face.
+    ``umbruch.Error`` is raised if it cannot be found or started."""
 
-    Measuring and rendering are requests over stdio, framed as in LSP.  ``measure``
-    returns baseline, line box, advance width and ink bounds, so Matplotlib is told
-    the ink extents directly; the line box is only used to place the text.  A server
-    that exited (panic, timeout) is started again and the idempotent request is
-    repeated once.
-    """
-
-    PROTOCOL = 1
     BATCH = 2000
 
-    def __init__(self, executable="umbruch", args=("--no-system-fonts",)):
+    def __init__(self, server=None):
         super().__init__()
-        self.executable = executable
-        self.args = list(args)
-        self._proc = None
-        self._lock = threading.RLock()
-        self._next_id = 0
-        self._pid = None
-        atexit.register(self.close)
-
-    # -- process and framing -------------------------------------------------
-
-    def _start(self):
-        self._proc = subprocess.Popen(
-            [self.executable, *self.args, "--serve"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE)
-        try:
-            hello, _ = self._exchange("hello", {"protocol": self.PROTOCOL})
-        except Exception:
-            self._kill()
-            raise
-        if hello.get("protocol") != self.PROTOCOL:
-            self._kill()
-            raise RuntimeError(f"umbruch speaks protocol {hello.get('protocol')}, "
-                               f"expected {self.PROTOCOL}")
-        self.capabilities = frozenset(hello.get("capabilities", ()))
+        self.server = server or umbruch.Server(system_fonts=False)
+        self._pid = os.getpid()
+        self.server.measure([])          # starts the process now, so that errors surface here
+        self.capabilities = self.server.capabilities
         missing = {"measure", "render"} - self.capabilities
         if missing:
-            self._kill()
-            raise RuntimeError(f"umbruch --serve lacks {sorted(missing)}")
-        self.version = hello.get("umbruch")
-        self._pid = os.getpid()
+            raise umbruch.Error("server", f"umbruch --serve lacks {sorted(missing)}")
 
-    def _kill(self):
-        p, self._proc = self._proc, None
-        if p is not None:
-            try:
-                p.kill()
-            except OSError:
-                pass
-            p.wait()
-
-    def _read_exact(self, n):
-        data = self._proc.stdout.read(n)
-        if len(data) != n:
-            raise EOFError("umbruch server closed the stream")
-        return data
-
-    def _exchange(self, op, params):
-        self._next_id += 1
-        body = json.dumps({"id": self._next_id, "op": op, "params": params},
-                          ensure_ascii=False).encode("utf-8")
-        self._proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
-        self._proc.stdin.flush()
-        length = None
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:
-                raise EOFError("umbruch server closed the stream")
-            line = line.strip()
-            if not line:
-                break
-            name, _, value = line.decode("ascii", "replace").partition(":")
-            if name.lower() == "content-length":
-                length = int(value)
-        if length is None:
-            raise RuntimeError("umbruch server sent a frame without Content-Length")
-        reply = json.loads(self._read_exact(length))
-        if reply.get("id") != self._next_id:
-            raise RuntimeError(f"umbruch server answered request {reply.get('id')}, "
-                               f"expected {self._next_id}")
-        if not reply.get("ok"):
-            e = reply.get("error", {})
-            raise RuntimeError(f"umbruch {op} failed: {e.get('code')}: {e.get('message')}")
-        result = reply["result"]
-        attachment = self._read_exact(result["attachment_length"]) \
-            if result.get("attachment_length") else b""
-        return result, attachment
-
-    def request(self, op, params):
-        with self._lock:
-            if self._proc is not None and self._pid != os.getpid():
-                # forked child: the pipes belong to the parent's conversation
-                for f in (self._proc.stdin, self._proc.stdout):
-                    try:
-                        f.close()
-                    except OSError:
-                        pass
-                self._proc = None
-            for attempt in (0, 1):
-                try:
-                    if self._proc is None or self._proc.poll() is not None:
-                        self._start()
-                    return self._exchange(op, params)
-                except (EOFError, BrokenPipeError, OSError):
-                    self._kill()
-                    if attempt:
-                        raise RuntimeError("the umbruch server keeps exiting") from None
-
-    # -- bridge --------------------------------------------------------------
+    def _own(self):
+        """The server, for this process: a forked child must not talk to the pipes of its
+        parent's process, so it gets a server of its own."""
+        if self._pid != os.getpid():
+            old, self._pid = self.server, os.getpid()
+            proc, old._proc = old._proc, None      # umbruch.Server has no fork handling
+            for stream in (proc.stdin, proc.stdout) if proc else ():
+                stream.close()
+            self.server = umbruch.Server(old.executable)
+            self.server.args = list(old.args)
+        return self.server
 
     def measure_many(self, items):
         items = [it for it in dict((self.key(m, f), (m, f)) for m, f in items).values()
@@ -520,9 +433,9 @@ class UmbruchServer(UmbruchBridge):
             rules = _font_face_css((f for _, f in chunk),
                                    math=any("<math" in m for m, _ in chunk))
             head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
-            result, _ = self.request("measure", {"probes": head + [
-                {"markup": m, "css": f["css"]} for m, f in chunk]})
-            for (markup, font), m in zip(chunk, result["metrics"][len(head):]):
+            metrics = self._own().measure(head + [
+                {"markup": m, "css": f["css"]} for m, f in chunk])
+            for (markup, font), m in zip(chunk, metrics[len(head):]):
                 if "error" in m:
                     raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
                 ink = m["ink"]
@@ -539,57 +452,21 @@ class UmbruchServer(UmbruchBridge):
                                 markup[:40])
 
     def render(self, svg, width, height):
-        result, pdf = self.request("render", {
-            "document": {"source": svg, "kind": "xml"}, "options": {}})
-        for w in result.get("warnings", ()):
-            if "no `lang`" not in str(w):  # PDF/UA is not a goal of a plot
+        rendered = umbruch.HTML(svg, xml=True, server=self._own()).render()
+        for w in rendered.warnings:
+            if "PDF/UA" not in str(w):  # not a goal of a plot
                 log.warning("umbruch: %s", w)
-        return pdf
+        return rendered.pdf
 
     def close(self):
-        with self._lock:
-            p, self._proc = self._proc, None
-        if p is None:
-            return
-        try:
-            self._proc = p
-            self._exchange("shutdown", {})
-        except Exception:
-            pass
-        finally:
-            self._proc = None
-            try:
-                p.stdin.close()
-                p.wait(timeout=5)
-            except Exception:
-                p.kill()
-
-
-def find_umbruch():
-    """The umbruch executable: $UMBRUCH, the one installed with the ``umbruch`` package,
-    or ``umbruch`` on PATH."""
-    exe = os.environ.get("UMBRUCH")
-    if exe:
-        return exe
-    try:
-        import umbruch
-        exe = umbruch.find_umbruch()
-    except ImportError:
-        exe = None
-    return exe or shutil.which("umbruch")
+        self.server.close()
 
 
 def get_bridge():
-    """The bridge to the umbruch server (started on first use).  There is no fallback to
-    another way of running umbruch: if it cannot be found or started, this raises."""
+    """The bridge to umbruch (started on first use); raises ``umbruch.Error`` if umbruch
+    cannot be found or started.  There is no fallback to another way of running it."""
     if config.bridge is None:
-        exe = find_umbruch()
-        if exe is None:
-            raise RuntimeError("umbruch executable not found: pip install umbruch, put it on "
-                               "PATH, or set $UMBRUCH (or umbruch_matplotlib.config.bridge)")
-        server = UmbruchServer(exe)
-        server._start()
-        config.bridge = server
+        config.bridge = UmbruchServer()
     return config.bridge
 
 
@@ -964,33 +841,47 @@ class RendererUmbruch(RendererSVG):
 
     def draw_gouraud_triangles(self, gc, triangles_array, colors_array, transform):
         mode = config.gouraud
-        if mode == "auto":
-            mode = "native" if "mesh_gouraud" in self.bridge.capabilities else "subdivide"
-        if mode not in ("native", "subdivide"):
+        if mode not in ("auto", "native", "subdivide"):
             raise ValueError(f"config.gouraud must be 'auto', 'subdivide' or 'native', "
                              f"not {mode!r}")
-        wr = self.writer
-        trans = self._make_flip_transform(transform.frozen())
         cols = np.asarray(colors_array, dtype=float)
         if cols.shape[-1] == 1:
             cols = np.repeat(cols, 3, axis=-1)
         if cols.shape[-1] == 3:
             cols = np.concatenate([cols, np.ones(cols.shape[:-1] + (1,))], axis=-1)
+        # umbruch paints a mesh as one shading: the colors are sRGB and have one alpha
+        problem = None
+        if "mesh_gouraud" not in self.bridge.capabilities:
+            problem = "this umbruch cannot paint meshes"
+        elif self.color_space not in (None, "srgb"):
+            problem = f"meshes are sRGB only, the figure is in {self.color_space}"
+        elif np.ptp(cols[..., 3]) > 1 / 512:
+            problem = "the alpha changes between the vertices"
+        if mode == "native" and problem:
+            raise ValueError(f"config.gouraud = 'native' is not possible: {problem}")
+        native = mode == "native" or (mode == "auto" and not problem)
+
+        wr = self.writer
+        trans = self._make_flip_transform(transform.frozen())
         wr.start("g", **self._get_clip_attrs(gc))
-        wr.start("g", attrib={"data-umbruch-mesh": "gouraud"})
-        for pts, c in zip(triangles_array, cols):
-            p = trans.transform(pts)
-            if mode == "native":
-                # exact vertex colors for a renderer that writes a type 4 shading
-                self._tri(p, c.mean(axis=0), extra={"data-colors": ";".join(
-                    ",".join(_fmt(v) for v in col) for col in c)})
-            else:
-                self._subdivided(p, c)
-        wr.end("g")
+        if native:
+            # the compact form: vertices (x y r g b a) and triangles as indices
+            xy = trans.transform(np.asarray(triangles_array, dtype=float).reshape(-1, 2))
+            rows = np.concatenate([xy, cols.reshape(-1, 4)], axis=1)
+            vertices, index = np.unique(rows, axis=0, return_inverse=True)
+            wr.element("g", attrib={
+                "data-umbruch-mesh": "gouraud",
+                "data-vertices": " ".join(map("{:.6g}".format, vertices.ravel())),
+                "data-triangles": " ".join(map(str, np.ravel(index)))})
+        else:
+            wr.start("g")
+            for pts, c in zip(triangles_array, cols):
+                self._subdivided(trans.transform(pts), c)
+            wr.end("g")
         wr.end("g")
 
-    def _tri(self, p, rgba, extra=None, seam=False):
-        attrib = {"fill-opacity": _fmt(rgba[3]), **(extra or {})}
+    def _tri(self, p, rgba, seam=False):
+        attrib = {"fill-opacity": _fmt(rgba[3])}
         if seam and rgba[3] >= 1:
             # a hairline of the same color hides the seams that antialiasing leaves
             # between flat neighbours

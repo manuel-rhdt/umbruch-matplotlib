@@ -6,7 +6,6 @@ import re
 import shutil
 import subprocess
 import sys
-import warnings
 import zlib
 import xml.etree.ElementTree as ET
 
@@ -14,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import numpy as np
 import pytest
+import umbruch
 import matplotlib
 matplotlib.use("module://umbruch_matplotlib")
 import matplotlib.pyplot as plt
@@ -21,7 +21,12 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.textpath import TextToPath
 import umbruch_matplotlib as hb
 
-need_umbruch = pytest.mark.skipif(hb.find_umbruch() is None, reason="umbruch not found")
+try:
+    hb.get_bridge()
+    _have_umbruch = True
+except umbruch.Error:
+    _have_umbruch = False
+need_umbruch = pytest.mark.skipif(not _have_umbruch, reason="umbruch not found")
 
 
 @pytest.fixture(autouse=True)
@@ -81,16 +86,56 @@ def test_malformed_rich_markup_is_reported(dummy_bridge, tmp_path):
         fig.savefig(tmp_path / "bad.pdf")
 
 
-@pytest.mark.parametrize("mode", ["subdivide", "native"])
-def test_gouraud_modes(dummy_bridge, tmp_path, mode):
+def _mesh_svg(bridge_caps, tmp_path, mode="auto", **save):
     hb.config.gouraud = mode
+    bridge = hb.config.bridge
+    bridge.capabilities = frozenset(bridge_caps)
     fig = fig_with_everything()
-    p = tmp_path / f"{mode}.svg"
-    fig.savefig(p)
-    t = p.read_text(encoding="utf-8")
-    ET.fromstring(t)
-    assert ("data-colors" in t) == (mode == "native")
-    assert "foreignObject" in t and "<i>Rate</i> r<sub>0</sub>" in t
+    buf = io.BytesIO()
+    fig.savefig(buf, format="svg", **save)
+    plt.close(fig)
+    svg = buf.getvalue().decode()
+    ET.fromstring(svg)
+    assert "foreignObject" in svg and "<i>Rate</i> r<sub>0</sub>" in svg
+    return svg
+
+
+def test_gouraud_subdivide_writes_flat_triangles(dummy_bridge, tmp_path):
+    for caps, mode in (({"mesh_gouraud"}, "subdivide"), (set(), "auto")):
+        svg = _mesh_svg(caps, tmp_path, mode)
+        assert "data-umbruch-mesh" not in svg and svg.count("<path") > 100
+
+
+def test_gouraud_native_writes_the_compact_mesh(dummy_bridge, tmp_path):
+    for mode in ("auto", "native"):
+        svg = _mesh_svg({"mesh_gouraud"}, tmp_path, mode)
+        m = re.search(r'data-umbruch-mesh="gouraud" data-vertices="([^"]*)" '
+                      r'data-triangles="([^"]*)"', svg)
+        v, tri = (np.array(m.group(i).split(), dtype=float) for i in (1, 2))
+        assert v.size % 6 == 0 and tri.size % 3 == 0 and tri.max() < v.size // 6
+        assert v.size // 6 < tri.size       # the vertices of neighbours are shared
+        assert (v[2:][::6] >= 0).all() and (v[5::6] == 1).all()     # r in 0..1, alpha 1
+
+
+def test_gouraud_native_needs_srgb_and_one_alpha(dummy_bridge, tmp_path):
+    svg = _mesh_svg({"mesh_gouraud"}, tmp_path, "auto", color_space="display-p3")
+    assert "data-umbruch-mesh" not in svg and "color(display-p3" in svg
+    with pytest.raises(ValueError, match="sRGB only"):
+        _mesh_svg({"mesh_gouraud"}, tmp_path, "native", color_space="display-p3")
+    with pytest.raises(ValueError, match="cannot paint"):
+        _mesh_svg(set(), tmp_path, "native")
+    # one alpha per vertex that differs: flat triangles in auto
+    hb.config.gouraud = "auto"
+    hb.config.bridge.capabilities = frozenset({"mesh_gouraud"})
+    fig, ax = plt.subplots()
+    tri = np.array([[[0, 0], [1, 0], [0, 1]]], dtype=float)
+    cols = np.array([[[1, 0, 0, 1], [0, 1, 0, 0.5], [0, 0, 1, 1]]])
+    out = io.StringIO()
+    renderer = hb.RendererUmbruch(10, 10, out, bridge=hb.config.bridge)
+    renderer.draw_gouraud_triangles(renderer.new_gc(), tri, cols, matplotlib.transforms.IdentityTransform())
+    renderer.finalize()
+    assert "data-umbruch-mesh" not in out.getvalue() and "<path" in out.getvalue()
+    plt.close(fig)
 
 
 def test_single_letter_mathrm_is_upright():
@@ -201,10 +246,11 @@ def test_no_fallback_when_the_server_cannot_start(monkeypatch, tmp_path):
     monkeypatch.setenv("UMBRUCH", str(tmp_path / "no-such-umbruch"))
     fig, ax = plt.subplots()
     ax.set_title("x")
-    with pytest.raises(OSError):
+    with pytest.raises(umbruch.Error, match="cannot start"):
         fig.savefig(io.BytesIO(), format="pdf")
-    monkeypatch.setattr(hb, "find_umbruch", lambda: None)
-    with pytest.raises(RuntimeError, match="not found"):
+    monkeypatch.delenv("UMBRUCH")
+    monkeypatch.setattr(umbruch, "find_umbruch", lambda: None)
+    with pytest.raises(umbruch.Error, match="not found"):
         fig.savefig(io.BytesIO(), format="svg")
     plt.close(fig)
 
@@ -345,7 +391,8 @@ def test_convert_color_and_cmap():
 @need_umbruch
 def test_metrics_agree_with_matplotlib(real_bridge):
     assert isinstance(real_bridge, hb.UmbruchServer), type(real_bridge)
-    assert real_bridge.request("hello", {})[0]["protocol"] == 1
+    assert isinstance(real_bridge.server, umbruch.Server)
+    assert {"measure", "render"} <= real_bridge.capabilities
     prop = FontProperties(size=10)
     for s in ["0.5", "plain label", "Wavy yg"]:
         w, h, d = real_bridge.measure(hb.escape(s), hb._font_spec(prop))
@@ -373,11 +420,11 @@ def test_pdf_end_to_end(real_bridge, tmp_path):
 
 @need_umbruch
 def test_server_restarts_after_a_crash(real_bridge):
-    pid = real_bridge._proc.pid
-    real_bridge._proc.kill()
-    real_bridge._proc.wait()
+    pid = real_bridge.server._proc.pid
+    real_bridge.server._proc.kill()
+    real_bridge.server._proc.wait()
     assert real_bridge.measure("again", hb._font_spec(FontProperties(size=10)))[0] > 0
-    assert real_bridge._proc.pid != pid
+    assert real_bridge.server._proc.pid != pid
 
 
 @need_umbruch
@@ -484,30 +531,12 @@ def test_flat_colors_are_read_in_the_color_space(real_bridge, tmp_path, space):
     assert np.abs(got - np.round(255 * np.array(rgb))).max() > 10
 
 
-def _umbruch_reads_image_profiles(bridge):
-    import base64
-    from PIL import Image
-    buf = io.BytesIO()
-    Image.new("RGB", (4, 4), (0, 255, 0)).save(buf, "PNG")
-    svg = ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"'
-           ' width="10" height="10"><image width="10" height="10" xlink:href="data:image/png;'
-           f'base64,{base64.b64encode(buf.getvalue()).decode()}"/></svg>')
-    svg = svg.replace(
-        "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
-        hb._tag_png_uri("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
-                        "display-p3"))
-    pdf = bridge.render(svg, 10, 10)
-    return re.search(rb"/Subtype\s*/Image.{0,80}ICCBased", pdf, re.S) is not None
-
-
 @need_umbruch
 @pytest.mark.skipif(not shutil.which("pdftoppm"), reason="needs pdftoppm")
 @pytest.mark.parametrize("space", ["display-p3", "rec2020"])
 def test_images_agree_with_flat_colors_in_the_color_space(real_bridge, tmp_path, space):
     """The same numbers as image pixels and as a flat color end up as the same color.
-    Needs an umbruch that uses the ICC profile of a PNG in an SVG <image>."""
-    if not _umbruch_reads_image_profiles(real_bridge):
-        pytest.skip("this umbruch ignores the ICC profile of images in SVG")
+    umbruch uses the ICC profile of the PNG in the SVG <image> (0.5.2 or later)."""
     rgb = (0.1, 0.9, 0.3)
     a, b = _pixel(tmp_path, _flat(rgb), "flat", space), _pixel(tmp_path, _image(rgb), "img", space)
     assert np.abs(a - b).max() <= 3, (space, a, b)
@@ -537,3 +566,27 @@ def test_precise_colors_reach_the_pdf(real_bridge):
     colors = [[float(x) for x in m.split()]
               for m in re.findall(rb"/CS\d+ cs ([\d. ]+) sc", content)]
     assert any(c == pytest.approx([0.1234567, 0.5, 0.9], abs=1e-4) for c in colors), colors  # umbruch writes 5 digits; 8-bit rounding would be 0.1216
+
+
+@need_umbruch
+@pytest.mark.skipif(not shutil.which("pdftoppm"), reason="needs pdftoppm")
+def test_native_mesh_matches_subdivided_triangles_and_is_smaller(real_bridge, tmp_path, monkeypatch):
+    from PIL import Image
+    if "mesh_gouraud" not in real_bridge.capabilities:
+        pytest.skip("this umbruch cannot paint meshes")
+    X, Y = np.meshgrid(np.linspace(0, 1, 30), np.linspace(0, 1, 30))
+    results = {}
+    for mode in ("native", "subdivide"):
+        monkeypatch.setattr(hb.config, "gouraud", mode)
+        fig = plt.figure(figsize=(2, 2))
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis("off")
+        ax.pcolormesh(X, Y, np.sin(5 * X) * np.cos(5 * Y), shading="gouraud", cmap="viridis")
+        pdf = tmp_path / f"{mode}.pdf"
+        fig.savefig(pdf)
+        plt.close(fig)
+        subprocess.run(["pdftoppm", "-r", "40", "-png", "-singlefile", str(pdf),
+                        str(tmp_path / mode)], check=True)
+        results[mode] = (pdf.stat().st_size, np.asarray(Image.open(tmp_path / f"{mode}.png").convert("RGB"), dtype=int))
+    assert np.abs(results["native"][1] - results["subdivide"][1]).mean() < 4
+    assert results["native"][0] < results["subdivide"][0] / 2
