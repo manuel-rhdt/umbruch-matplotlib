@@ -87,6 +87,19 @@ if shutil.which("pdftotext"):
     txt = subprocess.run(["pdftotext", pdf, "-"], capture_output=True, text=True).stdout
     for word in ("Rate", "plain label", "Hz"):
         assert word in txt, (word, txt)
+# 4b. gouraud meshes: with "auto" a renderer that reports mesh_gouraud gets one shading
+# instead of flat sub-triangles, which is much smaller
+if "mesh_gouraud" in bridge.capabilities:
+    sizes = {}
+    for mode in ("subdivide", "auto"):
+        hb.config.gouraud = mode
+        fig, ax = plt.subplots()
+        X, Y = np.meshgrid(np.linspace(0, 1, 30), np.linspace(0, 1, 30))
+        ax.pcolormesh(X, Y, np.sin(6 * X) * np.cos(5 * Y), shading="gouraud")
+        p = os.path.join(out, f"mesh_{mode}.pdf"); fig.savefig(p); plt.close(fig)
+        sizes[mode] = os.path.getsize(p)
+    hb.config.gouraud = "auto"
+    assert sizes["auto"] < sizes["subdivide"] / 1.5, sizes
 # 5. the server survives a crash: kill it, the next request starts a new one
 pid = bridge._proc.pid; bridge._proc.kill(); bridge._proc.wait()
 bridge._cache.clear()

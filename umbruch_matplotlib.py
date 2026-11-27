@@ -14,9 +14,11 @@ differ from stock SVG output:
   plain text, as with stock Matplotlib, plus what markup adds to the line box
   (sub/superscripts, fractions); the line box itself is used only to place the
   text on its baseline.
-* Gouraud triangles are drawn as flat sub-triangles (``config.gouraud ==
-  "subdivide"``) because umbruch does not read mesh shadings from SVG yet.
-  ``"native"`` writes exact vertex colors for a renderer that does.
+* Gouraud triangles: if umbruch reports the ``mesh_gouraud`` capability (``config.gouraud
+  == "auto"``, the default) the triangles are written with their exact vertex colors in a
+  ``<g data-umbruch-mesh="gouraud">`` group, which umbruch paints as one type 4 shading.
+  Otherwise (``"subdivide"``) they are drawn as flat sub-triangles.  The command line has no
+  capability exchange, so ``"auto"`` can only detect this over ``umbruch --serve``.
 * The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.
 
 Usage
@@ -736,17 +738,27 @@ class RendererUmbruch(RendererSVG):
         if cols.shape[-1] == 3:
             cols = np.concatenate([cols, np.ones(cols.shape[:-1] + (1,))], axis=-1)
         wr.start("g", **self._get_clip_attrs(gc))
-        wr.start("g", attrib={"data-umbruch-mesh": "gouraud"})
-        for pts, c in zip(triangles_array, cols):
-            p = trans.transform(pts)
-            if mode == "native":
-                # exact vertex colors for a renderer that writes a type 4 shading
-                self._tri(p, c.mean(axis=0), extra={"data-colors": ";".join(
-                    ",".join(_fmt(v) for v in col) for col in c)})
-            else:
-                self._subdivided(p, c)
+        # only a "native" mesh is tagged: its triangles carry the vertex colors
+        wr.start("g", attrib={"data-umbruch-mesh": "gouraud"} if mode == "native" else {})
+        if mode == "native":
+            self._native_triangles(trans, np.asarray(triangles_array, dtype=float), cols)
+        else:
+            for pts, c in zip(triangles_array, cols):
+                self._subdivided(trans.transform(pts), c)
         wr.end("g")
         wr.end("g")
+
+    def _native_triangles(self, trans, triangles, cols):
+        """One path per triangle with the exact vertex colors in ``data-colors``, written
+        as a single chunk: a mesh has tens of thousands of them."""
+        p = trans.transform(triangles.reshape(-1, 2)).reshape(-1, 3, 2)
+        mean = cols.mean(axis=1)
+        lines = [
+            '<path d="M%.3f %.3fL%.3f %.3fL%.3f %.3fZ" fill="%s" fill-opacity="%.4g" '
+            'stroke="none" data-colors="%.4g,%.4g,%.4g,%.4g;%.4g,%.4g,%.4g,%.4g;'
+            '%.4g,%.4g,%.4g,%.4g"/>' % (*pp.ravel(), rgb2hex(m[:3]), m[3], *c.ravel())
+            for pp, m, c in zip(p, mean, cols)]
+        self.writer.raw("\n".join(lines) + "\n")
 
     def _tri(self, p, rgba, extra=None, seam=False):
         attrib = {"fill-opacity": _fmt(rgba[3]), **(extra or {})}
