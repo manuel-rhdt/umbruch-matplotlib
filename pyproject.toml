@@ -9,7 +9,7 @@ description = "Matplotlib backend that renders PDF, text and math through umbruc
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = ["matplotlib>=3.8", "umbruch>=0.5.0"]
 
 [project.optional-dependencies]
