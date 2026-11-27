@@ -2,6 +2,7 @@
 skipped without it.  Run with ``pytest tests``."""
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,9 +88,31 @@ def test_gouraud_modes(dummy_bridge, tmp_path, mode):
     fig.savefig(p)
     t = p.read_text(encoding="utf-8")
     ET.fromstring(t)
-    assert ("data-colors" in t) == (mode == "native")
+    assert ("data-vertices" in t) == (mode == "native")
+    assert ("data-umbruch-mesh" in t) == (mode == "native")
     assert ("colorAdd" in t) == (mode == "stock")
     assert "foreignObject" in t and "<i>Rate</i> r<sub>0</sub>" in t
+
+
+def test_gouraud_defaults_to_the_native_mesh():
+    assert hb._Config.gouraud == "native"
+
+
+def test_a_native_mesh_is_one_element_with_shared_vertices(dummy_bridge, tmp_path):
+    # a 3 x 3 grid has 4 triangles per quad and 9 + 4 distinct vertices
+    hb.config.gouraud = "native"
+    fig, ax = plt.subplots()
+    ax.pcolormesh(np.arange(3.0), np.arange(3.0), np.arange(9.0).reshape(3, 3),
+                  shading="gouraud")
+    p = tmp_path / "mesh.svg"
+    fig.savefig(p, format="svg")
+    t = p.read_text(encoding="utf-8")
+    ET.fromstring(t)
+    assert t.count("data-umbruch-mesh") == 1
+    verts = re.search(r'data-vertices="([^"]*)"', t).group(1).split()
+    tris = re.search(r'data-triangles="([^"]*)"', t).group(1).split()
+    assert len(verts) == 13 * 6 and len(tris) == 16 * 3, (len(verts), len(tris))
+    assert max(map(int, tris)) == 12
 
 
 def test_single_letter_mathrm_is_upright():
@@ -237,6 +260,24 @@ def test_pdf_end_to_end(real_bridge, tmp_path):
                              text=True).stdout
         for word in ("Rate", "plain label", "Hz"):
             assert word in txt, (word, txt)
+
+
+@need_umbruch
+def test_native_mesh_is_much_smaller_than_subdivision(real_bridge, tmp_path):
+    if "mesh_gouraud" not in real_bridge.capabilities:
+        pytest.skip("this umbruch has no mesh_gouraud")
+    sizes = {}
+    for mode in ("subdivide", "native"):
+        hb.config.gouraud = mode
+        fig, ax = plt.subplots()
+        X, Y = np.meshgrid(np.linspace(0, 1, 30), np.linspace(0, 1, 30))
+        ax.pcolormesh(X, Y, np.sin(6 * X) * np.cos(5 * Y), shading="gouraud")
+        p = tmp_path / f"mesh_{mode}.pdf"
+        fig.savefig(p)
+        plt.close(fig)
+        sizes[mode] = p.stat().st_size
+    hb.config.gouraud = "native"
+    assert sizes["native"] < sizes["subdivide"] / 1.5, sizes
 
 
 @need_umbruch

@@ -14,9 +14,11 @@ differ from stock SVG output:
   plain text, as with stock Matplotlib, plus what markup adds to the line box
   (sub/superscripts, fractions); the line box itself is used only to place the
   text on its baseline.
-* Gouraud triangles are drawn as flat sub-triangles (``config.gouraud ==
-  "subdivide"``) because umbruch does not read mesh shadings from SVG yet.
-  ``"native"`` writes exact vertex colors for a renderer that does.
+* Gouraud triangles (``config.gouraud == "native"``, the default) are one compact
+  ``<g data-umbruch-mesh="gouraud" data-vertices=... data-triangles=...>`` element, which
+  umbruch paints as a single type 4 shading.  This is an umbruch extension of SVG that no
+  other renderer draws.  ``"subdivide"`` (flat sub-triangles) and ``"stock"``
+  (Matplotlib's gradient emulation) are polyfills for other renderers.
 * Fonts: the file that Matplotlib's font manager picks for each text is sent to
   umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
   under a name derived from the file; the font's own family list follows as fallback.
@@ -166,11 +168,14 @@ class _Config:
     #: callable(tex: str) -> MathML string, or None to use latex2mathml (an error
     #: if that is not installed).
     tex_to_mathml = None
-    #: "auto": "native" if the renderer reports the mesh_gouraud capability, else
-    #: "subdivide"; "subdivide": flat sub-triangles (works with any renderer);
-    #: "native": exact vertex colors in data-colors, for a renderer that writes a
-    #: type 4 shading; "stock": Matplotlib's three-gradient filter emulation.
-    gouraud = "auto"
+    #: "native" (default): the mesh is one compact ``<g data-umbruch-mesh="gouraud">``
+    #: element that umbruch writes as a single type 4 shading.  This is an umbruch
+    #: extension of SVG and nothing else draws it; it needs an umbruch that reports
+    #: the mesh_gouraud capability.  The alternatives are polyfills for other
+    #: renderers: "subdivide": flat sub-triangles (works with any renderer);
+    #: "stock": Matplotlib's three-gradient filter emulation; "auto": "native" if the
+    #: renderer reports mesh_gouraud, else "subdivide".
+    gouraud = "native"
     gouraud_max_level = 8
     #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
     #: Modern Math", or any OpenType math font Matplotlib finds) or the path of a font
@@ -749,6 +754,11 @@ class RendererUmbruch(RendererSVG):
         if mode == "stock":
             return super().draw_gouraud_triangles(gc, triangles_array, colors_array,
                                                   transform)
+        if (mode == "native" and self.bridge.capabilities
+                and "mesh_gouraud" not in self.bridge.capabilities):
+            log.warning("this umbruch lacks the mesh_gouraud capability: its Gouraud "
+                        "meshes are not drawn; update umbruch or set "
+                        "config.gouraud = 'subdivide'")
         wr = self.writer
         trans = self._make_flip_transform(transform.frozen())
         cols = np.asarray(colors_array, dtype=float)
@@ -757,17 +767,28 @@ class RendererUmbruch(RendererSVG):
         if cols.shape[-1] == 3:
             cols = np.concatenate([cols, np.ones(cols.shape[:-1] + (1,))], axis=-1)
         wr.start("g", **self._get_clip_attrs(gc))
-        wr.start("g", attrib={"data-umbruch-mesh": "gouraud"})
-        for pts, c in zip(triangles_array, cols):
-            p = trans.transform(pts)
-            if mode == "native":
-                # exact vertex colors for a renderer that writes a type 4 shading
-                self._tri(p, c.mean(axis=0), extra={"data-colors": ";".join(
-                    ",".join(_fmt(v) for v in col) for col in c)})
-            else:
-                self._subdivided(p, c)
+        if mode == "native":
+            self._native_mesh(trans, np.asarray(triangles_array, dtype=float), cols)
+        else:
+            wr.start("g")
+            for pts, c in zip(triangles_array, cols):
+                self._subdivided(trans.transform(pts), c)
+            wr.end("g")
         wr.end("g")
-        wr.end("g")
+
+    def _native_mesh(self, trans, triangles, cols):
+        """The mesh as one element: the distinct vertices (x, y, r, g, b, a) and the
+        triangles as indices into them.  A mesh of a grid shares most of its vertices
+        between triangles, and one element is much faster for umbruch to read than a
+        path per triangle."""
+        p = trans.transform(triangles.reshape(-1, 2))
+        rows = np.concatenate([np.round(p, 3), np.round(cols.reshape(-1, 4), 4)], axis=1)
+        rows = np.nan_to_num(rows, nan=0.0, posinf=0.0, neginf=0.0)
+        vertices, index = np.unique(rows, axis=0, return_inverse=True)
+        self.writer.element("g", attrib={
+            "data-umbruch-mesh": "gouraud",
+            "data-vertices": " ".join(map(repr, vertices.ravel().tolist())),
+            "data-triangles": " ".join(map(str, index.ravel().tolist()))})
 
     def _tri(self, p, rgba, extra=None, seam=False):
         attrib = {"fill-opacity": _fmt(rgba[3]), **(extra or {})}
