@@ -413,12 +413,12 @@ class UmbruchServer(UmbruchBridge):
         self.server = server or umbruch.Server(system_fonts=False)
         self.server.measure([])          # starts the process now, so that errors surface here
         self.capabilities = self.server.capabilities
-        missing = {"measure", "render"} - self.capabilities
+        missing = {"measure", "render", "stylesheet"} - self.capabilities
         if missing:
             raise umbruch.Error("server", f"umbruch --serve lacks {sorted(missing)}")
         # The @font-face rules of the fonts measured so far, by alias.  They are sent once
         # with set_stylesheet and only grow (an alias names one file), so what was measured
-        # stays valid.  An older umbruch has no stylesheet: its probes carry the rules.
+        # stays valid.
         self._rules = {}
         self._sheet_sent = frozenset()
 
@@ -427,10 +427,10 @@ class UmbruchServer(UmbruchBridge):
                  if self.key(*it) not in self._cache]
         for start in range(0, len(items), self.BATCH):
             chunk = items[start:start + self.BATCH]
-            head = self._font_faces(chunk)
-            metrics = self.server.measure(head + [
+            self._send_font_faces(chunk)
+            metrics = self.server.measure([
                 {"markup": m, "css": f["css"]} for m, f in chunk])
-            for (markup, font), m in zip(chunk, metrics[len(head):]):
+            for (markup, font), m in zip(chunk, metrics):
                 if "error" in m:
                     raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
                 ink = m["ink"]
@@ -446,19 +446,14 @@ class UmbruchServer(UmbruchBridge):
                     log.warning("no font has %s (in %r)", ", ".join(m["missing_glyphs"]),
                                 markup[:40])
 
-    def _font_faces(self, chunk):
-        """Makes the @font-face rules for *chunk* known to the server and returns the probes
-        to put in front of the request (none, with a server that remembers a style sheet)."""
+    def _send_font_faces(self, chunk):
+        """Makes the @font-face rules for *chunk* known to the server (once per face)."""
         faces = _faces_of((f for _, f in chunk), math=any("<math" in m for m, _ in chunk))
-        if "stylesheet" not in self.capabilities:
-            rules = _face_css(faces)
-            return [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
         new = {f["alias"]: _face_css([f]) for f in faces if f["alias"] not in self._rules}
         if new:
             self._rules.update(new)
             for warning in self.server.set_stylesheet("".join(self._rules.values())):
                 log.warning("umbruch: %s", warning)
-        return []
 
     def render(self, svg, width, height):
         rendered = umbruch.HTML(svg, xml=True, server=self.server).render()

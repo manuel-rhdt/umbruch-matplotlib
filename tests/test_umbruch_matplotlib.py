@@ -658,8 +658,6 @@ def _spec_of_file(path, size=10):
 @need_umbruch
 def test_font_faces_are_sent_once_as_the_stylesheet(real_bridge):
     from matplotlib import font_manager as fm
-    if "stylesheet" not in real_bridge.capabilities:
-        pytest.skip("this umbruch does not remember a style sheet")
     serif = next(e.fname for e in fm.fontManager.ttflist if e.fname.endswith("DejaVuSerif.ttf"))
     mono = next(e.fname for e in fm.fontManager.ttflist if e.fname.endswith("DejaVuSansMono.ttf"))
     sent = []
@@ -694,26 +692,3 @@ def test_a_large_request_measures_every_probe_in_the_face_of_matplotlib(real_bri
         w, _, _ = TextToPath().get_text_width_height_descent(text, FontProperties(fname=serif, size=10), False)
         assert abs(width - w) < 0.05 * w, (text, width, w)
 
-
-def test_an_umbruch_without_a_stylesheet_gets_the_rules_in_a_probe(dummy_bridge):
-    from matplotlib import font_manager as fm
-    serif = next(e.fname for e in fm.fontManager.ttflist if e.fname.endswith("DejaVuSerif.ttf"))
-    spec = _spec_of_file(serif)
-    calls = []
-
-    class Old(hb.UmbruchServer):
-        def __init__(self):
-            hb.UmbruchBridge.__init__(self)
-            self.capabilities = frozenset({"measure", "render"})
-            self._rules = {}
-
-            class S:
-                def measure(_, probes):
-                    calls.append(probes)
-                    return [{"width": 1, "ascent": 1, "descent": 0, "height": 1, "ink": None}
-                            for _ in probes]
-            self.server = S()
-
-    Old().measure_many([("x", spec)])
-    assert calls[0][0]["markup"].startswith("<style>@font-face")
-    assert len(calls[0]) == 2
