@@ -643,3 +643,52 @@ def test_native_mesh_matches_subdivided_triangles_and_is_smaller(real_bridge, tm
         results[mode] = (pdf.stat().st_size, np.asarray(Image.open(tmp_path / f"{mode}.png").convert("RGB"), dtype=int))
     assert np.abs(results["native"][1] - results["subdivide"][1]).mean() < 4
     assert results["native"][0] < results["subdivide"][0] / 2
+
+
+def _spec_of_file(path, size=10):
+    """A font spec for the file itself (so that it does not depend on how Matplotlib
+    spells the path of the font)."""
+    spec = hb._font_spec(FontProperties(fname=path))
+    assert spec["face"], "the font file is not known to Matplotlib"
+    spec = dict(spec, size=size)
+    spec["css"] = spec["css"].split("font-size:")[0] + f"font-size:{size}px"
+    return spec
+
+
+@need_umbruch
+def test_font_faces_are_sent_once_as_the_stylesheet(real_bridge):
+    from matplotlib import font_manager as fm
+    serif = next(e.fname for e in fm.fontManager.ttflist if e.fname.endswith("DejaVuSerif.ttf"))
+    mono = next(e.fname for e in fm.fontManager.ttflist if e.fname.endswith("DejaVuSansMono.ttf"))
+    sent = []
+    real = real_bridge.server.set_stylesheet
+    real_bridge.server.set_stylesheet = lambda css, **kw: (sent.append(css), real(css, **kw))[1]
+    try:
+        a = _spec_of_file(serif)
+        real_bridge.measure_many([("serif a", a)])
+        real_bridge.measure_many([("serif b", a)])      # the same face: nothing is sent
+        assert len(sent) == 1 and sent[0].count("@font-face") == 1
+        b = _spec_of_file(mono)
+        real_bridge.measure_many([("mono", b)])         # a new face: the sheet grows
+        assert len(sent) == 2 and sent[1].count("@font-face") == 2
+        assert sent[1].startswith(sent[0])
+    finally:
+        real_bridge.server.set_stylesheet = real
+
+
+@need_umbruch
+def test_a_large_request_measures_every_probe_in_the_face_of_matplotlib(real_bridge):
+    """All of the probes, also those after the first batch of the server, and those of a
+    later request, are set in the font that Matplotlib measured with."""
+    from matplotlib import font_manager as fm
+    serif = next(e.fname for e in fm.fontManager.ttflist if e.fname.endswith("DejaVuSerif.ttf"))
+    spec = _spec_of_file(serif)
+    items = [(f"hello{i % 10}", spec) for i in range(450)]
+    real_bridge.measure_many(items)
+    widths = {m: real_bridge._cache[real_bridge.key(m, spec)][0] for m, _ in items}
+    # the width of the same text in DejaVu Serif that Matplotlib itself computes
+    from matplotlib.textpath import TextToPath
+    for text, width in widths.items():
+        w, _, _ = TextToPath().get_text_width_height_descent(text, FontProperties(fname=serif, size=10), False)
+        assert abs(width - w) < 0.05 * w, (text, width, w)
+
