@@ -405,24 +405,11 @@ class UmbruchServer(UmbruchBridge):
     def __init__(self, server=None):
         super().__init__()
         self.server = server or umbruch.Server(system_fonts=False)
-        self._pid = os.getpid()
         self.server.measure([])          # starts the process now, so that errors surface here
         self.capabilities = self.server.capabilities
         missing = {"measure", "render"} - self.capabilities
         if missing:
             raise umbruch.Error("server", f"umbruch --serve lacks {sorted(missing)}")
-
-    def _own(self):
-        """The server, for this process: a forked child must not talk to the pipes of its
-        parent's process, so it gets a server of its own."""
-        if self._pid != os.getpid():
-            old, self._pid = self.server, os.getpid()
-            proc, old._proc = old._proc, None      # umbruch.Server has no fork handling
-            for stream in (proc.stdin, proc.stdout) if proc else ():
-                stream.close()
-            self.server = umbruch.Server(old.executable)
-            self.server.args = list(old.args)
-        return self.server
 
     def measure_many(self, items):
         items = [it for it in dict((self.key(m, f), (m, f)) for m, f in items).values()
@@ -433,7 +420,7 @@ class UmbruchServer(UmbruchBridge):
             rules = _font_face_css((f for _, f in chunk),
                                    math=any("<math" in m for m, _ in chunk))
             head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
-            metrics = self._own().measure(head + [
+            metrics = self.server.measure(head + [
                 {"markup": m, "css": f["css"]} for m, f in chunk])
             for (markup, font), m in zip(chunk, metrics[len(head):]):
                 if "error" in m:
@@ -452,7 +439,7 @@ class UmbruchServer(UmbruchBridge):
                                 markup[:40])
 
     def render(self, svg, width, height):
-        rendered = umbruch.HTML(svg, xml=True, server=self._own()).render()
+        rendered = umbruch.HTML(svg, xml=True, server=self.server).render()
         for w in rendered.warnings:
             if "PDF/UA" not in str(w):  # not a goal of a plot
                 log.warning("umbruch: %s", w)

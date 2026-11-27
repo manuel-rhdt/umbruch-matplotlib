@@ -434,22 +434,6 @@ def test_large_batches(real_bridge):
 
 
 @need_umbruch
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
-def test_forked_child_gets_its_own_server(real_bridge):
-    real_bridge.measure("parent", hb._font_spec(FontProperties(size=10)))
-    pid = os.fork()
-    if pid == 0:
-        try:
-            ok = hb.get_bridge().measure("child", hb._font_spec(FontProperties(size=10)))[0] > 0
-            os._exit(0 if ok else 1)
-        except BaseException:
-            os._exit(2)
-    _, status = os.waitpid(pid, 0)
-    assert status == 0
-    assert real_bridge.measure("parent again", hb._font_spec(FontProperties(size=10)))[0] > 0
-
-
-@need_umbruch
 @pytest.mark.skipif(not shutil.which("pdffonts"), reason="needs pdffonts")
 def test_tick_label_exponents_use_the_text_font(real_bridge, tmp_path):
     fig, ax = plt.subplots()
