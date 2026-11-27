@@ -16,8 +16,8 @@ differ from stock SVG output:
   text on its baseline.
 * Gouraud triangles are written as a ``data-umbruch-mesh`` group (compact form: shared
   vertices and triangle indices) that umbruch paints as one type 4 shading.  That
-  needs sRGB and one alpha per mesh; otherwise (or with ``config.gouraud ==
-  "subdivide"``) they are drawn as flat sub-triangles.
+  needs one alpha per mesh; otherwise (or with ``config.gouraud == "subdivide"``) they
+  are drawn as flat sub-triangles.  Neither works in a wide color space yet: that raises.
 * Fonts: the file that Matplotlib's font manager picks for each text is sent to
   umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
   under a name derived from the file; the font's own family list follows as fallback.
@@ -186,10 +186,10 @@ class _Config:
     #: callable(tex: str) -> MathML string, or None to use latex2mathml (an error
     #: if that is not installed).
     tex_to_mathml = None
-    #: "auto": "native" (a mesh shading, umbruch's ``data-umbruch-mesh``) when the figure
-    #: is in sRGB and the alpha is the same at all vertices, else "subdivide" (flat
-    #: sub-triangles); "native" and "subdivide" insist on one of them, "native" raising
-    #: if it is not possible.
+    #: "auto": "native" (a mesh shading, umbruch's ``data-umbruch-mesh``) when the alpha
+    #: is the same at all vertices, else "subdivide" (flat sub-triangles); "native" and
+    #: "subdivide" insist on one of them, "native" raising if it is not possible.  Not
+    #: supported in a wide ``color_space`` yet (umbruch paints meshes in sRGB).
     gouraud = "auto"
     gouraud_max_level = 8
     #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
@@ -831,6 +831,11 @@ class RendererUmbruch(RendererSVG):
         if mode not in ("auto", "native", "subdivide"):
             raise ValueError(f"config.gouraud must be 'auto', 'subdivide' or 'native', "
                              f"not {mode!r}")
+        if self.color_space not in (None, "srgb"):
+            raise NotImplementedError(
+                f"Gouraud shading is not supported in the {self.color_space} color space "
+                "yet (umbruch paints meshes in sRGB): use shading='flat' or 'nearest', "
+                "or color_space='srgb'")
         cols = np.asarray(colors_array, dtype=float)
         if cols.shape[-1] == 1:
             cols = np.repeat(cols, 3, axis=-1)
@@ -840,8 +845,6 @@ class RendererUmbruch(RendererSVG):
         problem = None
         if "mesh_gouraud" not in self.bridge.capabilities:
             problem = "this umbruch cannot paint meshes"
-        elif self.color_space not in (None, "srgb"):
-            problem = f"meshes are sRGB only, the figure is in {self.color_space}"
         elif np.ptp(cols[..., 3]) > 1 / 512:
             problem = "the alpha changes between the vertices"
         if mode == "native" and problem:

@@ -63,17 +63,18 @@ def real_bridge():
     plt.close("all")
 
 
-def fig_with_everything():
+def fig_with_everything(gouraud=True):
     fig, ax = plt.subplots(figsize=(5, 3.5), layout="constrained")
     x = np.linspace(0, 1, 40)
     ax.plot(x, np.sin(6 * x), label=r"curve $\sin(6x)$")
     ax.set_title(hb.rich("<i>Rate</i> r<sub>0</sub> in <b>Hz</b>"))
     ax.set_xlabel("plain label")
     ax.legend()
-    rng = np.random.default_rng(0)
-    xs, ys = rng.random((2, 30))
-    ins = ax.inset_axes([0.55, 0.12, 0.4, 0.35])
-    ins.tripcolor(xs, ys, np.hypot(xs, ys), shading="gouraud")
+    if gouraud:
+        rng = np.random.default_rng(0)
+        xs, ys = rng.random((2, 30))
+        ins = ax.inset_axes([0.55, 0.12, 0.4, 0.35])
+        ins.tripcolor(xs, ys, np.hypot(xs, ys), shading="gouraud")
     return fig
 
 
@@ -117,11 +118,15 @@ def test_gouraud_native_writes_the_compact_mesh(dummy_bridge, tmp_path):
         assert (v[2:][::6] >= 0).all() and (v[5::6] == 1).all()     # r in 0..1, alpha 1
 
 
-def test_gouraud_native_needs_srgb_and_one_alpha(dummy_bridge, tmp_path):
-    svg = _mesh_svg({"mesh_gouraud"}, tmp_path, "auto", color_space="display-p3")
-    assert "data-umbruch-mesh" not in svg and "color(display-p3" in svg
-    with pytest.raises(ValueError, match="sRGB only"):
-        _mesh_svg({"mesh_gouraud"}, tmp_path, "native", color_space="display-p3")
+def test_gouraud_is_not_supported_in_a_wide_color_space(dummy_bridge, tmp_path):
+    for mode in ("auto", "native", "subdivide"):
+        with pytest.raises(NotImplementedError, match="display-p3 color space"):
+            _mesh_svg({"mesh_gouraud"}, tmp_path, mode, color_space="display-p3")
+    # sRGB (explicit or not) is fine, and so is a wide space without a gouraud mesh
+    assert "data-umbruch-mesh" in _mesh_svg({"mesh_gouraud"}, tmp_path, "auto", color_space="srgb")
+
+
+def test_gouraud_native_needs_one_alpha_and_a_capable_umbruch(dummy_bridge, tmp_path):
     with pytest.raises(ValueError, match="cannot paint"):
         _mesh_svg(set(), tmp_path, "native")
     # one alpha per vertex that differs: flat triangles in auto
@@ -290,10 +295,9 @@ def test_unknown_color_space_raises(dummy_bridge):
 
 
 def test_no_hex_colors_are_left_in_a_color_space(dummy_bridge):
-    """Everything painted is written in the color space: fills, strokes, text, hatches,
-    gradient seams; no 8-bit hex colors survive in the SVG."""
-    hb.config.gouraud = "subdivide"
-    fig = fig_with_everything()
+    """Everything painted is written in the color space: fills, strokes, text, hatches;
+    no 8-bit hex colors survive in the SVG."""
+    fig = fig_with_everything(gouraud=False)
     ax = fig.axes[0]
     ax.bar([0.2], [0.5], hatch="//", facecolor="C1", edgecolor="C2")
     ax.scatter([0.5], [0.5], c="C3", s=60, marker="s")
@@ -306,7 +310,7 @@ def test_no_hex_colors_are_left_in_a_color_space(dummy_bridge):
     left = re.findall(r"(?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*[\"']?\s*#[0-9a-fA-F]{6}", svg)
     assert not left, left[:5]
     buf = io.BytesIO()
-    fig = fig_with_everything()
+    fig = fig_with_everything(gouraud=False)
     fig.savefig(buf, format="svg", color_space="srgb")     # the default: stock hex
     assert re.search(r"#[0-9a-f]{6}", buf.getvalue().decode())
     plt.close(fig)

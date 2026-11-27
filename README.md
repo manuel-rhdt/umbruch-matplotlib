@@ -28,7 +28,7 @@ Unsupported features raise instead of falling back to Matplotlib's own text rend
 
 Fonts come from Matplotlib: for every text, the font file that `font_manager.findfont` picks (including fonts added with `fontManager.addfont`) is sent to umbruch as an `@font-face` with a `data:` URI, so the PDF uses the face Matplotlib measured, with real italic and bold faces, and nothing depends on umbruch seeing the system's fonts. The families of the text follow as CSS fallbacks. The cost is the font file per request (a few milliseconds for 600 kB). Variable fonts are drawn in their default instance, and from a `.ttc` only the first face is read.
 
-Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math by default. `mathtext.fontset = "cm"` selects Latin Modern Math, and `umbruch_matplotlib.config.math_font` takes the family of any OpenType math font that Matplotlib finds (for example `"Libertinus Math"`, sent to umbruch like the text fonts) or the path of a font file; it needs a font with an OpenType MATH table. Gouraud triangles (`shading="gouraud"`) are painted by umbruch as one mesh shading; in a wide colour space, or with alpha that changes between vertices, they are drawn as flat sub-triangles instead (`config.gouraud` can insist on `"native"` or `"subdivide"`).
+Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math by default. `mathtext.fontset = "cm"` selects Latin Modern Math, and `umbruch_matplotlib.config.math_font` takes the family of any OpenType math font that Matplotlib finds (for example `"Libertinus Math"`, sent to umbruch like the text fonts) or the path of a font file; it needs a font with an OpenType MATH table. Gouraud triangles (`shading="gouraud"`) are painted by umbruch as one mesh shading; with alpha that changes between vertices they are drawn as flat sub-triangles instead (`config.gouraud` can insist on `"native"` or `"subdivide"`). They are not supported in a wide colour space yet, see below.
 
 ### Wide-gamut colours
 
@@ -39,11 +39,11 @@ umbruch_matplotlib.config.color_space = "display-p3"   # or fig.savefig(..., col
 ax.plot(x, y, color=(0.1, 0.9, 0.3))                   # these numbers are Display P3
 ```
 
-The spaces are those of CSS Color 4: `srgb` (the default), `display-p3`, `a98-rgb`, `prophoto-rgb` and `rec2020`. Painted colours (fill, stroke, text, hatches, gradient seams) are written as `color(display-p3 r g b)` from Matplotlib's float values, without the rounding to 1/255 of stock SVG; no hex colour is left in the SVG. Raster images are 8 bits per channel as Matplotlib makes them. (Matplotlib's own gradient emulation for Gouraud triangles, `config.gouraud = "stock"`, is gone: it only wrote hex colours.)
+The spaces are those of CSS Color 4: `srgb` (the default), `display-p3`, `a98-rgb`, `prophoto-rgb` and `rec2020`. Painted colours (fill, stroke, text, hatches) are written as `color(display-p3 r g b)` from Matplotlib's float values, without the rounding to 1/255 of stock SVG; no hex colour is left in the SVG. Raster images are 8 bits per channel as Matplotlib makes them. (Matplotlib's own gradient emulation for Gouraud triangles, `config.gouraud = "stock"`, is gone: it only wrote hex colours.)
 
 Everything Matplotlib itself supplies as sRGB (names like `"red"`, hex colours, the default colour cycle, the built-in colormaps) is then misread as P3 numbers. Convert it: `convert_color("tab:blue", dst="display-p3")` and `convert_cmap("viridis", dst="display-p3")` return values in the target space, clipped to its gamut.
 
-Raster images (`imshow`, rasterised artists) get an ICC profile of the space in their PNG, which umbruch uses as the colour space of the image. Native Gouraud meshes are sRGB only, so in a wide space they are drawn as flat triangles.
+Raster images (`imshow`, rasterised artists) get an ICC profile of the space in their PNG, which umbruch uses as the colour space of the image. Gouraud shading (`shading="gouraud"`) raises `NotImplementedError` in a wide space for now, because umbruch paints meshes in sRGB; use `shading="flat"` or `"nearest"`.
 
 ## Examples
 
