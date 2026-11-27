@@ -177,6 +177,27 @@ class _Config:
     #: file.  None follows ``mathtext.fontset``: "cm" is Latin Modern Math, anything
     #: else STIX Two Math.
     math_font = None
+    #: {"#rrggbb": CSS color}, applied to the SVG just before umbruch renders a PDF.
+    #: Matplotlib only knows sRGB, so a color outside sRGB is plotted as an sRGB
+    #: stand-in and replaced here by its exact CSS Color 4 form (``oklch(...)``,
+    #: ``lab(...)``, ``color(rec2020 ...)``), which umbruch writes as a wide-gamut
+    #: color.  It is replaced where a color is painted (fill, stroke, stop-color,
+    #: color), not in the text of a label.  Every use of the stand-in is replaced, so
+    #: pick one that no sRGB color of the figure shares.
+    wide_colors = {}
+
+
+# only where a color is painted (fill="#..", style="fill: #..", color: #..), not in the text
+# of a label
+_HEX = re.compile(r"((?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*[\"']?\s*)"
+                  r"(#[0-9a-fA-F]{6})\b")
+
+
+def _apply_wide_colors(svg, mapping):
+    if not mapping:
+        return svg
+    lut = {k.lower(): v for k, v in mapping.items()}
+    return _HEX.sub(lambda m: m.group(1) + lut.get(m.group(2).lower(), m.group(2)), svg)
 
 
 config = _Config()
@@ -857,7 +878,7 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
         self._prefetch(bridge)
         buf = io.StringIO()
         w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
-        data = bridge.render(buf.getvalue(), w, h)
+        data = bridge.render(_apply_wide_colors(buf.getvalue(), config.wide_colors), w, h)
         with cbook.open_file_cm(filename, "wb") as fh:
             fh.write(data)
 

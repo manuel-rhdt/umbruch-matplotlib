@@ -28,6 +28,8 @@ Fonts come from Matplotlib: for every text, the font file that `font_manager.fin
 
 Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math by default. `mathtext.fontset = "cm"` selects Latin Modern Math, and `umbruch_matplotlib.config.math_font` takes the family of any OpenType math font that Matplotlib finds (for example `"Libertinus Math"`, sent to umbruch like the text fonts) or the path of a font file; it needs a font with an OpenType MATH table. Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
 
+Matplotlib only knows sRGB. To get colours outside it into the PDF, plot with an sRGB stand-in and map it: `umbruch_matplotlib.config.wide_colors = {"#0a5fb4": "oklch(0.55 0.2 255)"}`. Before rendering, every painted use of the stand-in (`fill`, `stroke`, `stop-color`, `color`, not label text) is replaced by the CSS Color 4 value, which umbruch writes in an ICC space. Pick stand-ins that no other colour in the figure shares; images stay sRGB.
+
 ## Examples
 
 Rich text through `rich()`: inline markup for italics, bold, sub- and superscripts, colour and size, in titles, labels, tick labels and annotations.

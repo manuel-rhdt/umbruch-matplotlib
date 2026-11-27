@@ -2,10 +2,12 @@
 skipped without it.  Run with ``pytest tests``."""
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import warnings
+import zlib
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -208,6 +210,16 @@ def test_no_fallback_when_the_server_cannot_start(monkeypatch, tmp_path):
     plt.close(fig)
 
 
+def test_wide_colors_replace_painted_colors_only():
+    svg = ('<path fill="#FF0000" stroke="#00ff00"/><g style="color: #ff0000;fill:#0000ff"/>'
+           '<stop stop-color="#ff0000"/><div>#ff0000 in a label</div>')
+    out = hb._apply_wide_colors(svg, {"#ff0000": "color(rec2020 1 0 0)"})
+    assert out.count("color(rec2020 1 0 0)") == 3, out
+    assert 'stroke="#00ff00"' in out and "fill:#0000ff" in out
+    assert "<div>#ff0000 in a label</div>" in out
+    assert hb._apply_wide_colors(svg, {}) == svg
+
+
 # -- against the real umbruch ---------------------------------------------------
 
 @need_umbruch
@@ -312,3 +324,29 @@ def test_math_font_in_the_pdf(real_bridge, math_font, tmp_path, font, expect):
     fonts = subprocess.run(["pdffonts", str(path)], capture_output=True, text=True).stdout
     assert expect in fonts, fonts
     assert (font is None) == ("LatinModern" not in fonts), fonts
+
+
+@need_umbruch
+def test_wide_colors_reach_the_pdf(real_bridge, monkeypatch):
+    monkeypatch.setattr(hb.config, "wide_colors", {"#123456": "color(rec2020 1 0 0)"})
+    fig, ax = plt.subplots()
+    ax.bar([0], [1], color="#123456")
+    plain, wide = io.BytesIO(), io.BytesIO()
+    fig.savefig(wide, format="pdf")
+    monkeypatch.setattr(hb.config, "wide_colors", {})
+    fig.savefig(plain, format="pdf")
+    # a wide color is painted in an ICC space: "/CS1 cs <components> sc"
+    def painted_in_icc_space(pdf):
+        return any(re.search(rb"/CS\d+ cs [\d. ]+ sc", zlib.decompress(m.group(1)))
+                   for m in re.finditer(rb"stream\r?\n(.*?)endstream", pdf, re.S)
+                   if _inflates(m.group(1)))
+    assert painted_in_icc_space(wide.getvalue())
+    assert not painted_in_icc_space(plain.getvalue())
+
+
+def _inflates(data):
+    try:
+        zlib.decompress(data)
+    except zlib.error:
+        return False
+    return True
