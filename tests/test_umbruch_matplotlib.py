@@ -209,6 +209,26 @@ def test_no_fallback_when_the_server_cannot_start(monkeypatch, tmp_path):
     plt.close(fig)
 
 
+def test_private_parts_of_matplotlibs_svg_backend_are_there():
+    """What the import-time check cannot see: attributes set by the constructors."""
+    from matplotlib.backends.backend_svg import RendererSVG
+    writer = hb._XMLWriter(io.StringIO())
+    assert callable(writer._XMLWriter__flush) and callable(writer._XMLWriter__write)
+    renderer = RendererSVG(10, 10, io.StringIO())
+    assert isinstance(renderer._hatchd, dict)
+    assert renderer.writer.__class__ is hb._XMLWriter
+
+
+def test_hatches_in_the_color_space_with_and_without_line_width_in_the_key(dummy_bridge):
+    fig, ax = plt.subplots()
+    ax.bar([0], [1], hatch="//", facecolor="C1", edgecolor="C2")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="svg", color_space="display-p3")
+    svg = buf.getvalue().decode()
+    plt.close(fig)
+    assert "<pattern" in svg and "stroke-width" in svg and "color(display-p3" in svg
+
+
 def test_unknown_gouraud_mode_raises(dummy_bridge):
     hb.config.gouraud = "stock"
     fig = fig_with_everything()

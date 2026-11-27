@@ -69,8 +69,29 @@ import matplotlib as mpl
 from matplotlib import cbook, font_manager as fm
 from matplotlib.backend_bases import FigureManagerBase
 from matplotlib.backends.backend_mixed import MixedModeRenderer
-from matplotlib.backends.backend_svg import (
-    FigureCanvasSVG, RendererSVG, _XMLWriter, _generate_css)
+from matplotlib.backends import backend_svg as _backend_svg
+from matplotlib.backends.backend_svg import FigureCanvasSVG, RendererSVG
+
+# This backend builds on parts of Matplotlib's SVG backend that are not public API.
+# Before 3.11 the XML writer is called XMLWriter; check the rest, so that a Matplotlib
+# that changed them fails here with a message rather than somewhere in a drawing.
+_XMLWriter = getattr(_backend_svg, "_XMLWriter", None) or _backend_svg.XMLWriter
+_generate_css = getattr(_backend_svg, "_generate_css", None)
+_PRIVATE = {
+    "RendererSVG": [(RendererSVG, n) for n in (
+        "_get_clip_attrs", "_make_flip_transform", "_convert_path", "_get_style_dict",
+        "_write_hatches", "_get_hatch", "_make_id", "draw_gouraud_triangles")],
+    "the XML writer": [(_XMLWriter, n) for n in (
+        "_XMLWriter__flush", "start", "end", "element", "data")],
+    "backend_svg": [(_backend_svg, "_generate_css")],
+}
+_missing = [f"{where}.{name}" for where, items in _PRIVATE.items()
+            for obj, name in items if not hasattr(obj, name)]
+if _missing:
+    raise ImportError(
+        f"umbruch_matplotlib needs parts of Matplotlib's SVG backend that Matplotlib "
+        f"{mpl.__version__} does not have ({', '.join(_missing)}); it is tested with "
+        "Matplotlib 3.9 to 3.11")
 from matplotlib.colors import rgb2hex
 from matplotlib.transforms import Affine2D
 
@@ -837,7 +858,9 @@ class RendererUmbruch(RendererSVG):
         size = 72
         wr = self.writer
         wr.start("defs")
-        for (path, face, stroke, lw), oid in self._hatchd.values():
+        for (path, face, stroke, *lw), oid in self._hatchd.values():
+            # the line width is part of the key since Matplotlib 3.11
+            lw = lw[0] if lw else mpl.rcParams["hatch.linewidth"]
             wr.start("pattern", id=oid, patternUnits="userSpaceOnUse", x="0", y="0",
                      width=str(size), height=str(size))
             path_data = self._convert_path(

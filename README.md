@@ -21,6 +21,8 @@ fig.savefig("fig.pdf")
 
 Install with `pip install .[math]` (the `math` extra pulls in `latex2mathml`).
 
+The backend builds on parts of Matplotlib's SVG renderer that are not public API. It is tested with Matplotlib 3.9, 3.10 and 3.11 (CI runs the oldest and the newest), and on import it checks that the parts it needs are there, naming what is missing otherwise.
+
 Unsupported features raise instead of falling back to Matplotlib's own text rendering:
 `text.usetex`, and TeX that cannot be converted to MathML.
 
