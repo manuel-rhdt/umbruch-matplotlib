@@ -476,7 +476,8 @@ def _content_streams(pdf):
 
 @need_umbruch
 def test_precise_colors_reach_the_pdf(real_bridge):
-    """The PDF has the components as given (0.1234567), not rounded to 1/255 steps."""
+    """The PDF has the components as given (0.1234567, which umbruch writes with five
+    digits), not rounded to 1/255 steps (0.1216)."""
     from matplotlib.patches import Rectangle
     fig = plt.figure(figsize=(1, 1))
     fig.add_artist(Rectangle((0.1, 0.1), 0.8, 0.8, facecolor=(0.1234567, 0.5, 0.9),
@@ -486,4 +487,4 @@ def test_precise_colors_reach_the_pdf(real_bridge):
     content = _content_streams(buf.getvalue())
     colors = [[float(x) for x in m.split()]
               for m in re.findall(rb"/CS\d+ cs ([\d. ]+) sc", content)]
-    assert any(c == pytest.approx([0.1234567, 0.5, 0.9], abs=2e-6) for c in colors), colors
+    assert any(c == pytest.approx([0.1234567, 0.5, 0.9], abs=1e-4) for c in colors), colors  # umbruch writes 5 digits; 8-bit rounding would be 0.1216
