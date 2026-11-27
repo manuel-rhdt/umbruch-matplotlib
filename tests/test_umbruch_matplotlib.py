@@ -160,6 +160,41 @@ def test_svg_carries_the_fonts_it_uses(dummy_bridge, tmp_path):
     assert "@font-face" in t and f"font-family:'{alias}'" in t
 
 
+@pytest.fixture
+def math_font():
+    saved = hb.config.math_font
+    yield lambda v: setattr(hb.config, "math_font", v)
+    hb.config.math_font = saved
+
+
+def _math(tex=r"$x^2$"):
+    return hb.RendererUmbruch(1, 1, io.StringIO(), bridge=Dummy())._markup(tex, True)
+
+
+def test_math_font_default_and_fontset(math_font):
+    assert "style=" not in _math()
+    with matplotlib.rc_context({"mathtext.fontset": "cm"}):
+        assert "font-family:'Latin Modern Math'" in _math()
+    math_font("STIX Two Math")
+    assert "font-family:'STIX Two Math'" in _math()
+
+
+def test_math_font_from_a_file(math_font, tmp_path):
+    from matplotlib import font_manager as fm
+    path = fm.findfont("DejaVu Sans")      # any font file will do for the markup
+    math_font(path)
+    alias = hb._math_font()[1]["alias"]
+    assert f"font-family:'{alias}'" in _math()
+    assert f"font-family:'{alias}'" in hb._font_face_css([], math=True)
+    assert hb._font_face_css([], math=False) == ""
+
+
+def test_unknown_math_font_raises(math_font):
+    math_font("No Such Math Font")
+    with pytest.raises(ValueError, match="math font"):
+        _math()
+
+
 # -- against the real umbruch ---------------------------------------------------
 
 @need_umbruch
@@ -249,3 +284,18 @@ def test_fonts_not_bundled_with_umbruch_are_used(real_bridge, tmp_path):
     assert "DejaVuSans-Oblique" in fonts, fonts
     assert "DejaVuSans-BoldOblique" in fonts, fonts
     assert "Heros" not in fonts, fonts
+
+
+@need_umbruch
+@pytest.mark.skipif(not shutil.which("pdffonts"), reason="needs pdffonts")
+@pytest.mark.parametrize("font, expect", [(None, "STIXTwoMath"),
+                                          ("Latin Modern Math", "LatinModernMath")])
+def test_math_font_in_the_pdf(real_bridge, math_font, tmp_path, font, expect):
+    math_font(font)
+    fig, ax = plt.subplots()
+    ax.set_title(r"$\int_0^\infty e^{-x^2}dx$")
+    path = tmp_path / "m.pdf"
+    fig.savefig(path)
+    fonts = subprocess.run(["pdffonts", str(path)], capture_output=True, text=True).stdout
+    assert expect in fonts, fonts
+    assert (font is None) == ("LatinModern" not in fonts), fonts

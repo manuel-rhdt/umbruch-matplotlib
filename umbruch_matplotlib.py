@@ -20,6 +20,8 @@ differ from stock SVG output:
 * Fonts: the file that Matplotlib's font manager picks for each text is sent to
   umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
   under a name derived from the file; the font's own family list follows as fallback.
+  The font of math (``config.math_font``, or ``mathtext.fontset``) is set by a style
+  attribute on each <math>, since a style sheet would not reach the probes of a measure.
 * The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.
 
 Usage
@@ -170,6 +172,11 @@ class _Config:
     #: type 4 shading; "stock": Matplotlib's three-gradient filter emulation.
     gouraud = "auto"
     gouraud_max_level = 8
+    #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
+    #: Modern Math", or any OpenType math font Matplotlib finds) or the path of a font
+    #: file.  None follows ``mathtext.fontset``: "cm" is Latin Modern Math, anything
+    #: else STIX Two Math.
+    math_font = None
 
 
 config = _Config()
@@ -290,7 +297,8 @@ class UmbruchCli(UmbruchBridge):
         rows = [f'<div id="p{i}" style="{css}"><span id="s{i}" '
                 f'style="display:inline-block;width:0;height:0"></span>{markup}</div>'
                 for i, (markup, css) in enumerate(probes)]
-        doc = (f'<html xmlns="{XHTML}"><head><style>' + _font_face_css(fonts) +
+        doc = (f'<html xmlns="{XHTML}"><head><style>' +
+               _font_face_css(fonts, math=any("<math" in m for m, _ in probes)) +
                "@page{size:20000px 20000px;margin:0}"
                "html,body{margin:0;padding:0}"
                "div{position:absolute;left:0;top:0;white-space:pre;line-height:normal}"
@@ -448,7 +456,8 @@ class UmbruchServer(UmbruchBridge):
         for start in range(0, len(items), self.BATCH):
             chunk = items[start:start + self.BATCH]
             # @font-face rules apply to the probes of the same request
-            rules = _font_face_css(f for _, f in chunk)
+            rules = _font_face_css((f for _, f in chunk),
+                                   math=any("<math" in m for m, _ in chunk))
             head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
             result, _ = self.request("measure", {"probes": head + [
                 {"markup": m, "css": f["css"]} for m, f in chunk]})
@@ -541,13 +550,59 @@ def _face_of(path):
             "weight": weight, "style": entry.style if entry else None}
 
 
-def _font_face_css(fonts):
-    """@font-face rules (the font files as data: URIs) for the fonts of *fonts*."""
-    faces = {f["face"]["alias"]: f["face"] for f in fonts if f.get("face")}
+def _face_css(faces):
     return "".join(
         f"@font-face{{font-family:'{f['alias']}';font-weight:{f['weight']};"
         f"font-style:{f['style']};src:url({_font_data_uri(f['path'])})}}"
-        for f in faces.values())
+        for f in {f["alias"]: f for f in faces}.values())
+
+
+def _font_face_css(fonts, math=False):
+    """@font-face rules (the font files as data: URIs) for the fonts of *fonts*, and for
+    the math font if *math* and it is a file."""
+    faces = [f["face"] for f in fonts if f.get("face")]
+    if math:
+        faces.append(_math_font()[1])
+    return _face_css(f for f in faces if f)
+
+
+_MATH_BUNDLED = {"stix two math", "latin modern math"}
+
+
+def _math_font():
+    """(CSS font-family value, face to embed or None) of the math font."""
+    value = config.math_font
+    if value is None:
+        value = "Latin Modern Math" if mpl.rcParams["mathtext.fontset"] == "cm" else None
+    return _math_font_for(value)
+
+
+@functools.lru_cache(maxsize=None)
+def _math_font_for(value):
+    if value is None:
+        return None, None
+    if value.lower() in _MATH_BUNDLED:
+        return repr(value), None
+    path = value if os.path.isfile(value) else None
+    if path is None:
+        try:
+            path = fm.findfont(fm.FontProperties(family=value), fallback_to_default=False)
+        except ValueError:
+            raise ValueError(f"math font {value!r} not found: give the family of an "
+                             "OpenType math font Matplotlib can find, or a file") from None
+    ident = f"{path}:{os.path.getmtime(path)}"
+    face = {"alias": "mpl-math-" + hashlib.sha1(ident.encode()).hexdigest()[:12],
+            "path": path, "weight": 400, "style": "normal"}
+    return repr(face["alias"]), face
+
+
+def _style_math(ml):
+    """Set the math font on the <math> elements of *ml* (a rule in a style sheet would
+    not reach the probes of a measure request, a style attribute does)."""
+    family = _math_font()[0]
+    if family is None:
+        return ml
+    return re.sub(r"<math\b", f'<math style="font-family:{family}"', ml)
 
 
 def _font_spec(prop):
@@ -701,6 +756,7 @@ class RendererUmbruch(RendererSVG):
         self.writer.__class__ = _RawWriter
         self.bridge = bridge
         self._fonts = {}
+        self._math = False
 
     # -- text ---------------------------------------------------------------
 
@@ -736,7 +792,7 @@ class RendererUmbruch(RendererSVG):
                 raise RuntimeError(f"cannot convert math {m.group(1)!r} to MathML: the "
                                    "converter returned None")
             out.append(esc(s[pos:m.start()]).replace(r"\$", "$"))
-            out.append(ml)
+            out.append(_style_math(ml))
             pos = m.end()
         out.append(esc(s[pos:]).replace(r"\$", "$"))
         return "".join(out)
@@ -760,6 +816,7 @@ class RendererUmbruch(RendererSVG):
         font = _font_spec(prop)
         if font["face"]:
             self._fonts[font["face"]["alias"]] = font
+        self._math = self._math or "<math" in markup
         w, h, d = self.bridge.measure(markup, font)
         asc, box_h = self.bridge.ascent(markup, font)
         alpha = gc.get_alpha() if gc.get_forced_alpha() else gc.get_rgb()[3]
@@ -791,7 +848,7 @@ class RendererUmbruch(RendererSVG):
             wr.end("g")
 
     def finalize(self):
-        rules = _font_face_css(self._fonts.values())
+        rules = _font_face_css(self._fonts.values(), math=self._math)
         if rules:
             self.writer.start("style")
             self.writer.data(rules)
