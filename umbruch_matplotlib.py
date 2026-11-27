@@ -17,6 +17,9 @@ differ from stock SVG output:
 * Gouraud triangles are drawn as flat sub-triangles (``config.gouraud ==
   "subdivide"``) because umbruch does not read mesh shadings from SVG yet.
   ``"native"`` writes exact vertex colors for a renderer that does.
+* Fonts: the file that Matplotlib's font manager picks for each text is sent to
+  umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
+  under a name derived from the file; the font's own family list follows as fallback.
 * The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.
 
 Usage
@@ -39,6 +42,9 @@ Matplotlib's own text rendering.
 Tested against Matplotlib 3.11 and umbruch 0.5; it uses a few private attributes of
 the SVG renderer.
 """
+import base64
+import functools
+import hashlib
 import io
 import json
 import os
@@ -50,7 +56,6 @@ import logging
 import struct
 import tempfile
 import threading
-import warnings
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
@@ -183,8 +188,6 @@ class UmbruchBridge:
         self._collect = None
         #: what the renderer can do beyond the basics, e.g. {"mesh_gouraud"}
         self.capabilities = frozenset()
-        #: whether the renderer can see fonts installed on the system
-        self.system_fonts = False
 
     # to implement -----------------------------------------------------------
     def measure_many(self, items):
@@ -248,7 +251,6 @@ class UmbruchCli(UmbruchBridge):
         self.executable = executable
         self.args = list(args)
         self.timeout = timeout
-        self.system_fonts = "--no-system-fonts" not in self.args
 
     def _run(self, *argv):
         p = subprocess.run([self.executable, *self.args, *argv], capture_output=True,
@@ -273,7 +275,7 @@ class UmbruchCli(UmbruchBridge):
             base = _plain_text(markup)
             probes.append((markup, font["css"]))
             probes.append((escape(base), font["css"]))
-        boxes = self._probe(probes)
+        boxes = self._probe(probes, [f for _, f in items])
         for i, (markup, font) in enumerate(items):
             w, H, D, A = boxes[2 * i]
             _, Hb, Db, Ab = boxes[2 * i + 1]
@@ -283,12 +285,12 @@ class UmbruchCli(UmbruchBridge):
             self._cache[key] = (w, hi + up + down, di + down)
             self._ascent[key] = (A, H)
 
-    def _probe(self, probes):
+    def _probe(self, probes, fonts=()):
         """[(markup, css)] -> [(width, height, descent, ascent)] of the line boxes."""
         rows = [f'<div id="p{i}" style="{css}"><span id="s{i}" '
                 f'style="display:inline-block;width:0;height:0"></span>{markup}</div>'
                 for i, (markup, css) in enumerate(probes)]
-        doc = (f'<html xmlns="{XHTML}"><head><style>'
+        doc = (f'<html xmlns="{XHTML}"><head><style>' + _font_face_css(fonts) +
                "@page{size:20000px 20000px;margin:0}"
                "html,body{margin:0;padding:0}"
                "div{position:absolute;left:0;top:0;white-space:pre;line-height:normal}"
@@ -370,7 +372,6 @@ class UmbruchServer(UmbruchBridge):
             self._kill()
             raise RuntimeError(f"umbruch --serve lacks {sorted(missing)}")
         self.version = hello.get("umbruch")
-        self.system_fonts = bool(hello.get("fonts", {}).get("system_fonts", False))
         self._pid = os.getpid()
 
     def _kill(self):
@@ -446,9 +447,12 @@ class UmbruchServer(UmbruchBridge):
                  if self.key(*it) not in self._cache]
         for start in range(0, len(items), self.BATCH):
             chunk = items[start:start + self.BATCH]
-            result, _ = self.request("measure", {"probes": [
+            # @font-face rules apply to the probes of the same request
+            rules = _font_face_css(f for _, f in chunk)
+            head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
+            result, _ = self.request("measure", {"probes": head + [
                 {"markup": m, "css": f["css"]} for m, f in chunk]})
-            for (markup, font), m in zip(chunk, result["metrics"]):
+            for (markup, font), m in zip(chunk, result["metrics"][len(head):]):
                 if "error" in m:
                     raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
                 ink = m["ink"]
@@ -520,33 +524,47 @@ def get_bridge():
     return config.bridge
 
 
-#: families umbruch ships; with system fonts off, anything else is substituted
-_BUNDLED_FAMILIES = {"dejavu sans", "tex gyre heros", "tex gyre cursor", "tex gyre termes",
-                     "stix two math", "latin modern math"}
-_warned_families = set()
+@functools.lru_cache(maxsize=None)
+def _font_data_uri(path):
+    with open(path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode("ascii")
+    return f"data:{'font/otf' if path.lower().endswith('.otf') else 'font/ttf'};base64,{data}"
 
 
-def _warn_unbundled(prop):
-    bridge = config.bridge
-    if bridge is None or bridge.system_fonts or not bridge.handles_text:
-        return
-    for entry in prop.get_family():
-        key = entry.lower()
-        if entry in fm.font_family_aliases or key in ("sans", "sans serif") \
-                or key in _BUNDLED_FAMILIES or key in _warned_families:
-            continue
-        _warned_families.add(key)
-        warnings.warn(
-            f"font family {entry!r} is not bundled with umbruch and system fonts are "
-            "not available to it, so it will be substituted. Use TeX Gyre Heros, TeX "
-            "Gyre Termes, TeX Gyre Cursor or DejaVu Sans, or start umbruch with system "
-            "fonts (UmbruchServer(exe, args=())).", stacklevel=2)
+@functools.lru_cache(maxsize=None)
+def _face_of(path):
+    """The face Matplotlib found at *path*, as a description for @font-face."""
+    entry = next((e for e in fm.fontManager.ttflist if e.fname == path), None)
+    weight = int(fm.weight_dict.get(entry.weight, entry.weight)) if entry else None
+    ident = f"{path}:{os.path.getmtime(path)}"
+    return {"alias": "mpl-" + hashlib.sha1(ident.encode()).hexdigest()[:12], "path": path,
+            "weight": weight, "style": entry.style if entry else None}
+
+
+def _font_face_css(fonts):
+    """@font-face rules (the font files as data: URIs) for the fonts of *fonts*."""
+    faces = {f["face"]["alias"]: f["face"] for f in fonts if f.get("face")}
+    return "".join(
+        f"@font-face{{font-family:'{f['alias']}';font-weight:{f['weight']};"
+        f"font-style:{f['style']};src:url({_font_data_uri(f['path'])})}}"
+        for f in faces.values())
 
 
 def _font_spec(prop):
-    _warn_unbundled(prop)
+    """What the renderer needs to set text in *prop*: the CSS, and the font file that
+    Matplotlib itself would use, which is sent along as an @font-face (umbruch cannot
+    see the system's fonts, and this way it sets exactly the face Matplotlib measured
+    for).  The families of *prop* follow as fallbacks."""
     weight = prop.get_weight()
     weight = fm.weight_dict.get(weight, weight)
+    try:
+        face = _face_of(fm.findfont(prop))
+    except (ValueError, OSError):
+        face = None
+    if face and face["weight"] is not None:
+        weight, style = face["weight"], face["style"]
+    else:
+        face, style = None, prop.get_style()
     names = []
     for entry in prop.get_family():
         entry = "sans-serif" if entry in ("sans", "sans serif") else entry
@@ -557,11 +575,13 @@ def _font_spec(prop):
     names = list(dict.fromkeys(names))
     quoted = [n if n in fm.font_family_aliases or n == "sans-serif" else repr(n)
               for n in names]
+    if face:
+        quoted.insert(0, repr(face["alias"]))
     return {"prop": prop, "family": names, "size": float(prop.get_size()), "weight": int(weight),
-            "style": prop.get_style(), "variant": prop.get_variant(),
+            "face": face, "style": style, "variant": prop.get_variant(),
             "stretch": prop.get_stretch(),
             "css": (f"font-family:{', '.join(quoted)};font-size:{_fmt(prop.get_size())}px;"
-                    f"font-weight:{int(weight)};font-style:{prop.get_style()};"
+                    f"font-weight:{int(weight)};font-style:{style};"
                     f"font-variant:{prop.get_variant()}"
                     + ("" if prop.get_stretch() == "normal" else
                        f";font-stretch:{prop.get_stretch()}"))}
@@ -680,6 +700,7 @@ class RendererUmbruch(RendererSVG):
                          metadata=metadata)
         self.writer.__class__ = _RawWriter
         self.bridge = bridge
+        self._fonts = {}
 
     # -- text ---------------------------------------------------------------
 
@@ -737,6 +758,8 @@ class RendererUmbruch(RendererSVG):
                                      ismath, mtext)
         markup = self._markup(s, ismath)
         font = _font_spec(prop)
+        if font["face"]:
+            self._fonts[font["face"]["alias"]] = font
         w, h, d = self.bridge.measure(markup, font)
         asc, box_h = self.bridge.ascent(markup, font)
         alpha = gc.get_alpha() if gc.get_forced_alpha() else gc.get_rgb()[3]
@@ -766,6 +789,14 @@ class RendererUmbruch(RendererSVG):
         wr.end("g")
         if clip:
             wr.end("g")
+
+    def finalize(self):
+        rules = _font_face_css(self._fonts.values())
+        if rules:
+            self.writer.start("style")
+            self.writer.data(rules)
+            self.writer.end("style")
+        super().finalize()
 
     # -- meshes -------------------------------------------------------------
 

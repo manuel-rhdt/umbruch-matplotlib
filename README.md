@@ -24,7 +24,7 @@ Install with `pip install .[math]` (the `math` extra pulls in `latex2mathml`).
 Unsupported features raise instead of falling back to Matplotlib's own text rendering:
 `text.usetex`, and TeX that cannot be converted to MathML.
 
-Fonts are passed to umbruch exactly as Matplotlib names them; nothing is remapped. Umbruch bundles all four faces of TeX Gyre Heros, Cursor and Termes, but only the regular and bold faces of DejaVu Sans, so with Matplotlib's default family italic text is set upright. Other families, including ones installed on the system, are not visible to umbruch and are substituted with a warning. Set the family you want, for example `matplotlib.rcParams["font.family"] = "TeX Gyre Heros"`.
+Fonts come from Matplotlib: for every text, the font file that `font_manager.findfont` picks (including fonts added with `fontManager.addfont`) is sent to umbruch as an `@font-face` with a `data:` URI, so the PDF uses the face Matplotlib measured, with real italic and bold faces, and nothing depends on umbruch seeing the system's fonts. The families of the text follow as CSS fallbacks. The cost is the font file per request (a few milliseconds for 600 kB). Variable fonts are drawn in their default instance, and from a `.ttc` only the first face is read.
 
 Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math. Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
 

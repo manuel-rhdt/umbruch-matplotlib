@@ -137,21 +137,27 @@ def test_mathdefault_subset():
         hb._mathdefault_html(r"\mathdefault{\alpha}")
 
 
-def test_unbundled_font_warns_once(dummy_bridge):
-    dummy_bridge.system_fonts = False
-    hb._warned_families.clear()
-    with pytest.warns(UserWarning, match="Imaginary Sans"):
-        hb._font_spec(FontProperties(family="Imaginary Sans"))
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        hb._font_spec(FontProperties(family="Imaginary Sans"))
-        hb._font_spec(FontProperties(family="TeX Gyre Heros"))
-        hb._font_spec(FontProperties(family=["sans-serif"]))
-    dummy_bridge.system_fonts = True
-    hb._warned_families.clear()
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        hb._font_spec(FontProperties(family="Imaginary Sans"))
+def test_font_spec_names_the_file_matplotlib_found():
+    from matplotlib import font_manager as fm
+    prop = FontProperties(family="DejaVu Serif", style="italic", weight="bold")
+    spec = hb._font_spec(prop)
+    assert spec["face"]["path"] == fm.findfont(prop)
+    assert spec["css"].startswith(f"font-family:'{spec['face']['alias']}', 'DejaVu Serif'")
+    assert "font-weight:700;font-style:italic" in spec["css"]
+    rules = hb._font_face_css([spec])
+    assert rules.count("@font-face") == 1 and "base64," in rules
+    assert f"font-family:'{spec['face']['alias']}'" in rules
+
+
+def test_svg_carries_the_fonts_it_uses(dummy_bridge, tmp_path):
+    fig, ax = plt.subplots()
+    ax.set_title("x", fontfamily="DejaVu Serif")
+    p = tmp_path / "f.svg"
+    fig.savefig(p)
+    t = p.read_text(encoding="utf-8")
+    ET.fromstring(t)
+    alias = hb._font_spec(FontProperties(family="DejaVu Serif"))["face"]["alias"]
+    assert "@font-face" in t and f"font-family:'{alias}'" in t
 
 
 # -- against the real umbruch ---------------------------------------------------
@@ -225,3 +231,21 @@ def test_tick_label_exponents_use_the_text_font(real_bridge, tmp_path):
     fig.savefig(path)
     fonts = subprocess.run(["pdffonts", str(path)], capture_output=True, text=True).stdout
     assert "STIX" not in fonts, fonts
+
+
+@need_umbruch
+@pytest.mark.skipif(not shutil.which("pdffonts"), reason="needs pdffonts")
+def test_fonts_not_bundled_with_umbruch_are_used(real_bridge, tmp_path):
+    """DejaVu Serif and the italic and bold-italic DejaVu Sans are not among umbruch's
+    own fonts; they come from the files Matplotlib found."""
+    fig, ax = plt.subplots()
+    ax.set_title("serif title", fontfamily="DejaVu Serif")
+    ax.set_xlabel("slanted", fontstyle="italic")
+    ax.set_ylabel("slanted bold", fontstyle="italic", fontweight="bold")
+    path = tmp_path / "fonts.pdf"
+    fig.savefig(path)
+    fonts = subprocess.run(["pdffonts", str(path)], capture_output=True, text=True).stdout
+    assert "DejaVuSerif" in fonts, fonts
+    assert "DejaVuSans-Oblique" in fonts, fonts
+    assert "DejaVuSans-BoldOblique" in fonts, fonts
+    assert "Heros" not in fonts, fonts
