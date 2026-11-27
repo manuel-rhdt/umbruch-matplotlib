@@ -52,7 +52,8 @@ for mode in ("subdivide", "native", "stock"):
     fig = fig_with_everything()
     p = os.path.join(out, f"{mode}.svg"); fig.savefig(p)
     t = open(p, encoding="utf-8").read(); ET.fromstring(t)
-    assert ("data-colors" in t) == (mode == "native"), mode
+    assert ("data-vertices" in t) == (mode == "native"), mode
+    assert ("data-umbruch-mesh" in t) == (mode == "native"), mode
     assert ("colorAdd" in t) == (mode == "stock"), mode
     assert "foreignObject" in t and "<i>Rate</i> r<sub>0</sub>" in t
     plt.close(fig)
@@ -87,19 +88,31 @@ if shutil.which("pdftotext"):
     txt = subprocess.run(["pdftotext", pdf, "-"], capture_output=True, text=True).stdout
     for word in ("Rate", "plain label", "Hz"):
         assert word in txt, (word, txt)
-# 4b. gouraud meshes: with "auto" a renderer that reports mesh_gouraud gets one shading
-# instead of flat sub-triangles, which is much smaller
+# 4b. gouraud meshes: native (the default) is one shading instead of flat sub-triangles, which
+# is much smaller
 if "mesh_gouraud" in bridge.capabilities:
+    assert hb._Config.gouraud == "native"
     sizes = {}
-    for mode in ("subdivide", "auto"):
+    for mode in ("subdivide", "native"):
         hb.config.gouraud = mode
         fig, ax = plt.subplots()
         X, Y = np.meshgrid(np.linspace(0, 1, 30), np.linspace(0, 1, 30))
         ax.pcolormesh(X, Y, np.sin(6 * X) * np.cos(5 * Y), shading="gouraud")
         p = os.path.join(out, f"mesh_{mode}.pdf"); fig.savefig(p); plt.close(fig)
         sizes[mode] = os.path.getsize(p)
-    hb.config.gouraud = "auto"
-    assert sizes["auto"] < sizes["subdivide"] / 1.5, sizes
+    hb.config.gouraud = "native"
+    assert sizes["native"] < sizes["subdivide"] / 1.5, sizes
+# 4c. the mesh is one element with shared vertices: a 3 x 3 grid has 4 triangles per quad and
+# 9 + 4 distinct vertices
+hb.config.gouraud = "native"
+fig, ax = plt.subplots()
+ax.pcolormesh(np.arange(3.0), np.arange(3.0), np.arange(9.0).reshape(3, 3), shading="gouraud")
+p = os.path.join(out, "mesh_compact.svg"); fig.savefig(p, format="svg"); plt.close(fig)
+t = open(p, encoding="utf-8").read(); ET.fromstring(t)
+assert t.count("data-umbruch-mesh") == 1, t.count("data-umbruch-mesh")
+verts = re.search(r'data-vertices="([^"]*)"', t).group(1).split()
+tris = re.search(r'data-triangles="([^"]*)"', t).group(1).split()
+assert len(verts) == 13 * 6 and len(tris) == 16 * 3, (len(verts), len(tris))
 # 5. the server survives a crash: kill it, the next request starts a new one
 pid = bridge._proc.pid; bridge._proc.kill(); bridge._proc.wait()
 bridge._cache.clear()
