@@ -15,28 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The engine is not on PyPI yet, so build the binary from source.
-      - uses: actions/checkout@v4
-        with:
-          repository: manuel-rhdt/umbruch
-          path: umbruch-src
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: umbruch-src
-      - run: cargo build --release --no-default-features
-        working-directory: umbruch-src
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: sudo apt-get update && sudo apt-get install -y poppler-utils
-      - run: pip install matplotlib latex2mathml build
-      - run: pip install --no-deps .
+      - run: pip install .[math] pytest
       - name: Tests
-        run: python tests/test_umbruch_matplotlib.py
-        env:
-          UMBRUCH: ${{ github.workspace }}/umbruch-src/target/release/umbruch
+        run: python -m pytest tests -v
 
   package:
     runs-on: ubuntu-latest

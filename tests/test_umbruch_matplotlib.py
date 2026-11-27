@@ -1,9 +1,17 @@
-"""Tests against the real umbruch binary ($UMBRUCH or PATH); skipped without it."""
-import io, os, re, shutil, subprocess, sys, tempfile
+"""Tests; those that need the real umbruch binary ($UMBRUCH, the package or PATH) are
+skipped without it.  Run with ``pytest tests``."""
+import io
+import os
+import shutil
+import subprocess
+import sys
+import warnings
 import xml.etree.ElementTree as ET
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import numpy as np
+import pytest
 import matplotlib
 matplotlib.use("module://umbruch_matplotlib")
 import matplotlib.pyplot as plt
@@ -11,8 +19,41 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.textpath import TextToPath
 import umbruch_matplotlib as hb
 
-out = tempfile.mkdtemp()
-have_umbruch = hb.get_bridge() is not None
+need_umbruch = pytest.mark.skipif(hb.find_umbruch() is None, reason="umbruch not found")
+
+
+@pytest.fixture(autouse=True)
+def default_font():
+    """A bundled family, whatever the matplotlibrc of the machine says."""
+    with matplotlib.rc_context({"font.family": "DejaVu Sans"}):
+        yield
+
+
+class Dummy(hb.UmbruchBridge):
+    def measure_many(self, items):
+        for m, f in items:
+            self._cache[self.key(m, f)] = (10.0, 8.0, 2.0)
+            self._ascent[self.key(m, f)] = (9.0, 11.0)
+
+    def render(self, svg, w, h):
+        return b"%PDF-dummy"
+
+
+@pytest.fixture
+def dummy_bridge():
+    saved, saved_g = hb.config.bridge, hb.config.gouraud
+    hb.config.bridge = Dummy()
+    yield hb.config.bridge
+    hb.config.bridge, hb.config.gouraud = saved, saved_g
+    plt.close("all")
+
+
+@pytest.fixture
+def real_bridge():
+    bridge = hb.get_bridge()
+    bridge._cache.clear()
+    yield bridge
+    plt.close("all")
 
 
 def fig_with_everything():
@@ -29,110 +70,158 @@ def fig_with_everything():
     return fig
 
 
-# 1. malformed rich markup is reported, whatever the bridge
-class Dummy(hb.UmbruchBridge):
-    def measure_many(self, items):
-        for m, f in items:
-            self._cache[self.key(m, f)] = (10.0, 8.0, 2.0)
-            self._ascent[self.key(m, f)] = (9.0, 11.0)
-    def render(self, svg, w, h):
-        return b"%PDF-dummy"
+# -- no renderer needed ---------------------------------------------------------
 
-saved, hb.config.bridge = hb.config.bridge, Dummy()
-fig, ax = plt.subplots(); ax.set_title(hb.rich("<b>oops"))
-try:
-    fig.savefig(os.path.join(out, "bad.pdf")); raise SystemExit("expected ValueError")
-except ValueError as e:
-    print("malformed markup ->", str(e)[:50])
-plt.close(fig)
+def test_malformed_rich_markup_is_reported(dummy_bridge, tmp_path):
+    fig, ax = plt.subplots()
+    ax.set_title(hb.rich("<b>oops"))
+    with pytest.raises(ValueError, match="well-formed"):
+        fig.savefig(tmp_path / "bad.pdf")
 
-# 2. gouraud modes (no renderer needed: SVG output)
-for mode in ("subdivide", "native", "stock"):
+
+@pytest.mark.parametrize("mode", ["subdivide", "native", "stock"])
+def test_gouraud_modes(dummy_bridge, tmp_path, mode):
     hb.config.gouraud = mode
     fig = fig_with_everything()
-    p = os.path.join(out, f"{mode}.svg"); fig.savefig(p)
-    t = open(p, encoding="utf-8").read(); ET.fromstring(t)
-    assert ("data-colors" in t) == (mode == "native"), mode
-    assert ("colorAdd" in t) == (mode == "stock"), mode
+    p = tmp_path / f"{mode}.svg"
+    fig.savefig(p)
+    t = p.read_text(encoding="utf-8")
+    ET.fromstring(t)
+    assert ("data-colors" in t) == (mode == "native")
+    assert ("colorAdd" in t) == (mode == "stock")
     assert "foreignObject" in t and "<i>Rate</i> r<sub>0</sub>" in t
-    plt.close(fig)
-hb.config.gouraud = "subdivide"
-hb.config.bridge = saved
-
-if not have_umbruch:
-    print("umbruch not found: skipping the end-to-end tests"); sys.exit(0)
-
-# 3. metrics: ink heights/descents come from umbruch's measure op and must agree with
-# Matplotlib's own glyph extents to within 2% of the font size
-bridge = hb.get_bridge()
-assert isinstance(bridge, hb.UmbruchServer), type(bridge)
-assert bridge.request('hello', {})[0]['protocol'] == 1
-for s in ["0.5", "plain label", "Wavy yg"]:
-    prop = FontProperties(size=10)
-    w, h, d = bridge.measure(hb.escape(s), hb._font_spec(prop))
-    w0, h0, d0 = TextToPath().get_text_width_height_descent(s, prop, False)
-    assert abs(h - h0) < 0.2 and abs(d - d0) < 0.2 and 0.95 * w0 <= w <= 1.2 * w0, (s, w, w0, h, h0, d, d0)
-w, h, d = bridge.measure("E = mc<sup>2</sup>", hb._font_spec(FontProperties(size=10)))
-_, h0, _ = bridge.measure("E = mc2", hb._font_spec(FontProperties(size=10)))
-assert h > h0, "a superscript must make the box taller"
-
-bridge._cache.clear()
-
-# 4. end to end: PDF, tight bbox, text is real text
-fig = fig_with_everything()
-pdf = os.path.join(out, "fig.pdf"); fig.savefig(pdf)
-assert open(pdf, "rb").read(4) == b"%PDF"
-fig.savefig(os.path.join(out, "tight.pdf"), bbox_inches="tight")
-if shutil.which("pdftotext"):
-    txt = subprocess.run(["pdftotext", pdf, "-"], capture_output=True, text=True).stdout
-    for word in ("Rate", "plain label", "Hz"):
-        assert word in txt, (word, txt)
-# 5. the server survives a crash: kill it, the next request starts a new one
-pid = bridge._proc.pid; bridge._proc.kill(); bridge._proc.wait()
-bridge._cache.clear()
-assert bridge.measure("again", hb._font_spec(FontProperties(size=10)))[0] > 0
-assert bridge._proc.pid != pid
-# batching: many probes in one request
-bridge.measure_many([(f"label {i}", hb._font_spec(FontProperties(size=10))) for i in range(3000)])
-print("ok", out)
-
-# 6. unsupported features fail instead of falling back
-import matplotlib.pyplot as plt
-for label, kw in [(r"$\notamacro{x}$", {}), ("x", {"usetex": False})]:
-    pass
-fig, ax = plt.subplots(); ax.set_xlabel(r"$\definitelynotamacro{x}$")
-try:
-    fig.savefig(os.path.join(out, "bad.pdf")); raise SystemExit("unsupported math did not fail")
-except RuntimeError as e:
-    assert "MathML" in str(e), e
-plt.close(fig)
-print("failure tests ok")
-
-
-def test_tick_label_exponents_use_the_text_font():
-    import matplotlib.pyplot as plt, subprocess, tempfile
-    fig, ax = plt.subplots()
-    ax.loglog([1, 1e4], [1e-3, 1e3])
-    path = os.path.join(tempfile.mkdtemp(), "log.pdf")
-    fig.savefig(path)
-    fonts = subprocess.run(["pdffonts", path], capture_output=True, text=True).stdout
-    assert "STIX" not in fonts, fonts
-    for bad in (r"\mathdefault{\alpha}",):
-        try:
-            hb._mathdefault_html(bad)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("unsupported macro must raise")
 
 
 def test_single_letter_mathrm_is_upright():
-    import umbruch_matplotlib as u
-    ml = u._default_tex_to_mathml(r"\mathrm{s}^{-1}")
+    ml = hb._default_tex_to_mathml(r"\mathrm{s}^{-1}")
     assert 'mathvariant="normal">s<' in ml, ml
-    assert 'mathvariant="normal"' not in u._default_tex_to_mathml("s")
+    assert 'mathvariant="normal"' not in hb._default_tex_to_mathml("s")
 
 
-if __name__ == "__main__":
-    test_tick_label_exponents_use_the_text_font()
-    test_single_letter_mathrm_is_upright()
+def _children(el):
+    return [c.tag.rsplit("}", 1)[-1] + (f"({c.text})" if c.text else "") for c in el]
+
+
+def test_function_application_stays_outside_scripts():
+    root = ET.fromstring(hb._default_tex_to_mathml(r"\sin^2\theta+\cos\theta"))
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] == "msup":
+            assert len(el) == 2, _children(el)
+    flat = _children(root[0])
+    # msup, function application, theta, +, cos, function application, theta
+    assert flat[:3] == ["msup", "mo(⁡)", "mi(θ)"], flat
+    assert flat[4:6] == ["mi(cos)", "mo(⁡)"], flat
+    # a function inside a script that is not its base is still followed by the operator
+    ml = hb._default_tex_to_mathml(r"x_{\sin y}")
+    assert "⁡" in ml
+
+
+def test_unknown_macro_raises(dummy_bridge):
+    fig, ax = plt.subplots()
+    ax.set_xlabel(r"$\definitelynotamacro{x}$")
+    with pytest.raises(RuntimeError, match="MathML"):
+        fig.savefig(io.BytesIO(), format="pdf")
+
+
+def test_usetex_raises(dummy_bridge):
+    with matplotlib.rc_context({"text.usetex": True}):
+        fig, ax = plt.subplots()
+        ax.set_title("x")
+        with pytest.raises(NotImplementedError):
+            fig.savefig(io.BytesIO(), format="pdf")
+
+
+def test_mathdefault_subset():
+    assert hb._mathdefault_html(r"\mathdefault{10^{3}}") == "10<sup>3</sup>"
+    with pytest.raises(ValueError):
+        hb._mathdefault_html(r"\mathdefault{\alpha}")
+
+
+def test_unbundled_font_warns_once(dummy_bridge):
+    dummy_bridge.system_fonts = False
+    hb._warned_families.clear()
+    with pytest.warns(UserWarning, match="Imaginary Sans"):
+        hb._font_spec(FontProperties(family="Imaginary Sans"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        hb._font_spec(FontProperties(family="Imaginary Sans"))
+        hb._font_spec(FontProperties(family="TeX Gyre Heros"))
+        hb._font_spec(FontProperties(family=["sans-serif"]))
+    dummy_bridge.system_fonts = True
+    hb._warned_families.clear()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        hb._font_spec(FontProperties(family="Imaginary Sans"))
+
+
+# -- against the real umbruch ---------------------------------------------------
+
+@need_umbruch
+def test_metrics_agree_with_matplotlib(real_bridge):
+    assert isinstance(real_bridge, hb.UmbruchServer), type(real_bridge)
+    assert real_bridge.request("hello", {})[0]["protocol"] == 1
+    prop = FontProperties(size=10)
+    for s in ["0.5", "plain label", "Wavy yg"]:
+        w, h, d = real_bridge.measure(hb.escape(s), hb._font_spec(prop))
+        w0, h0, d0 = TextToPath().get_text_width_height_descent(s, prop, False)
+        assert abs(h - h0) < 0.2 and abs(d - d0) < 0.2 and 0.95 * w0 <= w <= 1.2 * w0, \
+            (s, w, w0, h, h0, d, d0)
+    _, h, _ = real_bridge.measure("E = mc<sup>2</sup>", hb._font_spec(prop))
+    _, h0, _ = real_bridge.measure("E = mc2", hb._font_spec(prop))
+    assert h > h0, "a superscript must make the box taller"
+
+
+@need_umbruch
+def test_pdf_end_to_end(real_bridge, tmp_path):
+    fig = fig_with_everything()
+    pdf = tmp_path / "fig.pdf"
+    fig.savefig(pdf)
+    assert pdf.read_bytes()[:4] == b"%PDF"
+    fig.savefig(tmp_path / "tight.pdf", bbox_inches="tight")
+    if shutil.which("pdftotext"):
+        txt = subprocess.run(["pdftotext", str(pdf), "-"], capture_output=True,
+                             text=True).stdout
+        for word in ("Rate", "plain label", "Hz"):
+            assert word in txt, (word, txt)
+
+
+@need_umbruch
+def test_server_restarts_after_a_crash(real_bridge):
+    pid = real_bridge._proc.pid
+    real_bridge._proc.kill()
+    real_bridge._proc.wait()
+    assert real_bridge.measure("again", hb._font_spec(FontProperties(size=10)))[0] > 0
+    assert real_bridge._proc.pid != pid
+
+
+@need_umbruch
+def test_large_batches(real_bridge):
+    real_bridge.measure_many([(f"label {i}", hb._font_spec(FontProperties(size=10)))
+                              for i in range(3000)])
+
+
+@need_umbruch
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_forked_child_gets_its_own_server(real_bridge):
+    real_bridge.measure("parent", hb._font_spec(FontProperties(size=10)))
+    pid = os.fork()
+    if pid == 0:
+        try:
+            ok = hb.get_bridge().measure("child", hb._font_spec(FontProperties(size=10)))[0] > 0
+            os._exit(0 if ok else 1)
+        except BaseException:
+            os._exit(2)
+    _, status = os.waitpid(pid, 0)
+    assert status == 0
+    assert real_bridge.measure("parent again", hb._font_spec(FontProperties(size=10)))[0] > 0
+
+
+@need_umbruch
+@pytest.mark.skipif(not shutil.which("pdffonts"), reason="needs pdffonts")
+def test_tick_label_exponents_use_the_text_font(real_bridge, tmp_path):
+    fig, ax = plt.subplots()
+    ax.loglog([1, 1e4], [1e-3, 1e3])
+    path = tmp_path / "log.pdf"
+    fig.savefig(path)
+    fonts = subprocess.run(["pdffonts", str(path)], capture_output=True, text=True).stdout
+    assert "STIX" not in fonts, fonts

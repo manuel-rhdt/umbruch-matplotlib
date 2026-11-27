@@ -28,15 +28,16 @@ Usage
     ax.set_xlabel(r"$\alpha^2$ (needs the latex2mathml package)")
     fig.savefig("out.pdf")
 
-The ``umbruch`` executable is taken from $UMBRUCH or PATH.  Rich text is marked by
+The ``umbruch`` executable is taken from $UMBRUCH, the ``umbruch`` package or PATH.  Rich text is marked by
 a leading U+FEFF (see ``rich``), which survives Matplotlib's string handling.
 The markup must be well-formed XML (numeric entities, not &nbsp;), and a newline
 splits lines as for any Matplotlib text.  ``$...$`` in a plain or rich string is
 converted to MathML by ``config.tex_to_mathml`` (default: latex2mathml).  Math
-that cannot be converted falls back to Matplotlib's own mathtext, drawn as paths.
+that cannot be converted raises, as does ``text.usetex``; there is no fallback to
+Matplotlib's own text rendering.
 
-Tested against Matplotlib 3.11 and umbruch 0.4.2 (7c77f07); it uses a few private
-attributes of the SVG renderer.
+Tested against Matplotlib 3.11 and umbruch 0.5; it uses a few private attributes of
+the SVG renderer.
 """
 import io
 import json
@@ -49,6 +50,7 @@ import logging
 import struct
 import tempfile
 import threading
+import warnings
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
@@ -120,15 +122,24 @@ def _fix_mathml(ml):
             el.tag = ns + "mo"
         elif tag == "mo" and txt == ".":
             el.tag = ns + "mi"
-    for parent in root.iter():
-        kids = list(parent)
-        for i in range(len(kids) - 1, -1, -1):
-            el = kids[i]
-            if el.tag.rsplit("}", 1)[-1] == "mi" and (el.text or "") in _FUNCTIONS \
-                    and i + 1 < len(kids) and kids[i + 1].tag.rsplit("}", 1)[-1] != "mo":
-                fa = ET.Element(ns + "mo")
-                fa.text = "\u2061"
-                parent.insert(i + 1, fa)
+    # Function application goes after the function, which for \sin^2 means after the
+    # whole <msup>: inside it, the script would get three children.
+    parents = {child: parent for parent in root.iter() for child in parent}
+    local = lambda e: e.tag.rsplit("}", 1)[-1]
+    funcs = [el for el in root.iter() if local(el) == "mi" and (el.text or "") in _FUNCTIONS]
+    for el in reversed(funcs):
+        target = el
+        while target in parents and local(parents[target]) in _ARITY \
+                and parents[target][0] is target:
+            target = parents[target]
+        parent = parents.get(target)
+        if parent is None:
+            continue
+        i = list(parent).index(target)
+        if i + 1 < len(parent) and local(parent[i + 1]) != "mo":
+            fa = ET.Element(ns + "mo")
+            fa.text = "\u2061"
+            parent.insert(i + 1, fa)
     return ET.tostring(root, encoding="unicode")
 
 
@@ -142,11 +153,11 @@ def _default_tex_to_mathml(tex):
 
 
 class _Config:
-    #: UmbruchBridge instance; if None, UMBRUCH_CMD / UMBRUCH_MEASURE_CMD are used.
+    #: UmbruchBridge instance; if None, one is created for the umbruch executable
+    #: found by ``find_umbruch``.
     bridge = None
-    #: callable(tex: str) -> MathML string, or None to use latex2mathml if present.
-    #: Without any converter, math falls back to Matplotlib's own mathtext, drawn
-    #: as paths by the SVG renderer.
+    #: callable(tex: str) -> MathML string, or None to use latex2mathml (an error
+    #: if that is not installed).
     tex_to_mathml = None
     #: "auto": "native" if the renderer reports the mesh_gouraud capability, else
     #: "subdivide"; "subdivide": flat sub-triangles (works with any renderer);
@@ -172,6 +183,8 @@ class UmbruchBridge:
         self._collect = None
         #: what the renderer can do beyond the basics, e.g. {"mesh_gouraud"}
         self.capabilities = frozenset()
+        #: whether the renderer can see fonts installed on the system
+        self.system_fonts = False
 
     # to implement -----------------------------------------------------------
     def measure_many(self, items):
@@ -235,6 +248,7 @@ class UmbruchCli(UmbruchBridge):
         self.executable = executable
         self.args = list(args)
         self.timeout = timeout
+        self.system_fonts = "--no-system-fonts" not in self.args
 
     def _run(self, *argv):
         p = subprocess.run([self.executable, *self.args, *argv], capture_output=True,
@@ -332,6 +346,7 @@ class UmbruchServer(UmbruchBridge):
         self._proc = None
         self._lock = threading.RLock()
         self._next_id = 0
+        self._pid = None
         atexit.register(self.close)
 
     # -- process and framing -------------------------------------------------
@@ -355,6 +370,8 @@ class UmbruchServer(UmbruchBridge):
             self._kill()
             raise RuntimeError(f"umbruch --serve lacks {sorted(missing)}")
         self.version = hello.get("umbruch")
+        self.system_fonts = bool(hello.get("fonts", {}).get("system_fonts", False))
+        self._pid = os.getpid()
 
     def _kill(self):
         p, self._proc = self._proc, None
@@ -404,6 +421,14 @@ class UmbruchServer(UmbruchBridge):
 
     def request(self, op, params):
         with self._lock:
+            if self._proc is not None and self._pid != os.getpid():
+                # forked child: the pipes belong to the parent's conversation
+                for f in (self._proc.stdin, self._proc.stdout):
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+                self._proc = None
             for attempt in (0, 1):
                 try:
                     if self._proc is None or self._proc.poll() is not None:
@@ -495,7 +520,31 @@ def get_bridge():
     return config.bridge
 
 
+#: families umbruch ships; with system fonts off, anything else is substituted
+_BUNDLED_FAMILIES = {"dejavu sans", "tex gyre heros", "tex gyre cursor", "tex gyre termes",
+                     "stix two math", "latin modern math"}
+_warned_families = set()
+
+
+def _warn_unbundled(prop):
+    bridge = config.bridge
+    if bridge is None or bridge.system_fonts or not bridge.handles_text:
+        return
+    for entry in prop.get_family():
+        key = entry.lower()
+        if entry in fm.font_family_aliases or key in ("sans", "sans serif") \
+                or key in _BUNDLED_FAMILIES or key in _warned_families:
+            continue
+        _warned_families.add(key)
+        warnings.warn(
+            f"font family {entry!r} is not bundled with umbruch and system fonts are "
+            "not available to it, so it will be substituted. Use TeX Gyre Heros, TeX "
+            "Gyre Termes, TeX Gyre Cursor or DejaVu Sans, or start umbruch with system "
+            "fonts (UmbruchServer(exe, args=())).", stacklevel=2)
+
+
 def _font_spec(prop):
+    _warn_unbundled(prop)
     weight = prop.get_weight()
     weight = fm.weight_dict.get(weight, weight)
     names = []
@@ -838,8 +887,8 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
         bridge = get_bridge()
         if bridge is None:
             raise RuntimeError(
-                "No umbruch bridge: set umbruch_matplotlib.config.bridge, or "
-                "UMBRUCH_CMD and UMBRUCH_MEASURE_CMD")
+                "umbruch executable not found: pip install umbruch, put it on PATH, "
+                "or set $UMBRUCH (or umbruch_matplotlib.config.bridge)")
         self._prefetch(bridge)
         buf = io.StringIO()
         w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
