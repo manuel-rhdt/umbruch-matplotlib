@@ -87,6 +87,20 @@ def test_malformed_rich_markup_is_reported(dummy_bridge, tmp_path):
         fig.savefig(tmp_path / "bad.pdf")
 
 
+@pytest.mark.parametrize("mode", ["subdivide", "native", "stock"])
+def test_gouraud_modes(dummy_bridge, tmp_path, mode):
+    hb.config.gouraud = mode
+    fig = fig_with_everything()
+    p = tmp_path / f"{mode}.svg"
+    fig.savefig(p)
+    t = p.read_text(encoding="utf-8")
+    ET.fromstring(t)
+    assert ("data-vertices" in t) == (mode == "native")
+    assert ("data-umbruch-mesh" in t) == (mode == "native")
+    assert ("colorAdd" in t) == (mode == "stock")
+    assert "foreignObject" in t and "<i>Rate</i> r<sub>0</sub>" in t
+
+
 def _mesh_svg(bridge_caps, tmp_path, mode="auto", **save):
     hb.config.gouraud = mode
     bridge = hb.config.bridge
@@ -119,28 +133,61 @@ def test_gouraud_native_writes_the_compact_mesh(dummy_bridge, tmp_path):
 
 
 def test_gouraud_is_not_supported_in_a_wide_color_space(dummy_bridge, tmp_path):
-    for mode in ("auto", "native", "subdivide"):
+    for mode in ("auto", "native", "subdivide", "stock"):
         with pytest.raises(NotImplementedError, match="display-p3 color space"):
             _mesh_svg({"mesh_gouraud"}, tmp_path, mode, color_space="display-p3")
     # sRGB (explicit or not) is fine, and so is a wide space without a gouraud mesh
     assert "data-umbruch-mesh" in _mesh_svg({"mesh_gouraud"}, tmp_path, "auto", color_space="srgb")
 
 
-def test_gouraud_native_needs_one_alpha_and_a_capable_umbruch(dummy_bridge, tmp_path):
-    with pytest.raises(ValueError, match="cannot paint"):
-        _mesh_svg(set(), tmp_path, "native")
-    # one alpha per vertex that differs: flat triangles in auto
-    hb.config.gouraud = "auto"
+def test_gouraud_native_needs_one_alpha_and_warns_without_the_capability(
+        dummy_bridge, tmp_path, caplog):
+    with caplog.at_level("WARNING"):
+        svg = _mesh_svg({"something_else"}, tmp_path, "native")
+    assert "mesh_gouraud capability" in caplog.text and "data-umbruch-mesh" in svg
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        _mesh_svg(set(), tmp_path, "native")     # no capabilities known: no warning
+    assert "mesh_gouraud" not in caplog.text
+    # an alpha that changes between the vertices: native raises, auto draws flat triangles
     hb.config.bridge.capabilities = frozenset({"mesh_gouraud"})
-    fig, ax = plt.subplots()
     tri = np.array([[[0, 0], [1, 0], [0, 1]]], dtype=float)
     cols = np.array([[[1, 0, 0, 1], [0, 1, 0, 0.5], [0, 0, 1, 1]]])
-    out = io.StringIO()
-    renderer = hb.RendererUmbruch(10, 10, out, bridge=hb.config.bridge)
-    renderer.draw_gouraud_triangles(renderer.new_gc(), tri, cols, matplotlib.transforms.IdentityTransform())
-    renderer.finalize()
-    assert "data-umbruch-mesh" not in out.getvalue() and "<path" in out.getvalue()
-    plt.close(fig)
+
+    def draw(mode):
+        hb.config.gouraud = mode
+        out = io.StringIO()
+        renderer = hb.RendererUmbruch(10, 10, out, bridge=hb.config.bridge)
+        renderer.draw_gouraud_triangles(renderer.new_gc(), tri, cols,
+                                        matplotlib.transforms.IdentityTransform())
+        renderer.finalize()
+        return out.getvalue()
+
+    with pytest.raises(ValueError, match="alpha changes"):
+        draw("native")
+    flat = draw("auto")
+    assert "data-umbruch-mesh" not in flat and "<path" in flat
+
+
+def test_gouraud_defaults_to_the_native_mesh():
+    assert hb._Config.gouraud == "native"
+
+
+def test_a_native_mesh_is_one_element_with_shared_vertices(dummy_bridge, tmp_path):
+    # a 3 x 3 grid has 4 triangles per quad and 9 + 4 distinct vertices
+    hb.config.gouraud = "native"
+    fig, ax = plt.subplots()
+    ax.pcolormesh(np.arange(3.0), np.arange(3.0), np.arange(9.0).reshape(3, 3),
+                  shading="gouraud")
+    p = tmp_path / "mesh.svg"
+    fig.savefig(p, format="svg")
+    t = p.read_text(encoding="utf-8")
+    ET.fromstring(t)
+    assert t.count("data-umbruch-mesh") == 1
+    verts = re.search(r'data-vertices="([^"]*)"', t).group(1).split()
+    tris = re.search(r'data-triangles="([^"]*)"', t).group(1).split()
+    assert len(verts) == 13 * 6 and len(tris) == 16 * 3, (len(verts), len(tris))
+    assert max(map(int, tris)) == 12
 
 
 def test_single_letter_mathrm_is_upright():
@@ -281,7 +328,7 @@ def test_hatches_in_the_color_space_with_and_without_line_width_in_the_key(dummy
 
 
 def test_unknown_gouraud_mode_raises(dummy_bridge):
-    hb.config.gouraud = "stock"
+    hb.config.gouraud = "polyfill"
     fig = fig_with_everything()
     with pytest.raises(ValueError, match="config.gouraud"):
         fig.savefig(io.BytesIO(), format="svg")
@@ -420,6 +467,24 @@ def test_pdf_end_to_end(real_bridge, tmp_path):
                              text=True).stdout
         for word in ("Rate", "plain label", "Hz"):
             assert word in txt, (word, txt)
+
+
+@need_umbruch
+def test_native_mesh_is_much_smaller_than_subdivision(real_bridge, tmp_path):
+    if "mesh_gouraud" not in real_bridge.capabilities:
+        pytest.skip("this umbruch has no mesh_gouraud")
+    sizes = {}
+    for mode in ("subdivide", "native"):
+        hb.config.gouraud = mode
+        fig, ax = plt.subplots()
+        X, Y = np.meshgrid(np.linspace(0, 1, 30), np.linspace(0, 1, 30))
+        ax.pcolormesh(X, Y, np.sin(6 * X) * np.cos(5 * Y), shading="gouraud")
+        p = tmp_path / f"mesh_{mode}.pdf"
+        fig.savefig(p)
+        plt.close(fig)
+        sizes[mode] = p.stat().st_size
+    hb.config.gouraud = "native"
+    assert sizes["native"] < sizes["subdivide"] / 1.5, sizes
 
 
 @need_umbruch
