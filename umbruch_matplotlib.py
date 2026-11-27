@@ -239,103 +239,6 @@ class UmbruchBridge:
         pass
 
 
-class UmbruchCli(UmbruchBridge):
-    """Bridge to the ``umbruch`` executable as it is today.
-
-    Rendering: ``umbruch in.svg out.pdf`` (an SVG file is one page of the size of
-    the drawing; foreignObject holds HTML and MathML).
-
-    Measuring: there is no measuring mode, so a batch of strings is set in an XHTML
-    document, one absolutely positioned block each, and ``--dump-layout`` gives the
-    boxes.  A zero-size inline-block in front of the text sits on the first baseline,
-    which gives the ascent.  One process answers a whole batch (about 20 ms), and the
-    canvas collects the strings of a figure first (``_prefetch``), so the cost is per
-    figure and not per label.
-    """
-
-    def __init__(self, executable="umbruch", args=("--no-system-fonts",), timeout=120):
-        super().__init__()
-        self.executable = executable
-        self.args = list(args)
-        self.timeout = timeout
-
-    def _run(self, *argv):
-        p = subprocess.run([self.executable, *self.args, *argv], capture_output=True,
-                           timeout=self.timeout, check=False)
-        if p.returncode:
-            raise RuntimeError(f"umbruch failed ({p.returncode}): "
-                               f"{p.stderr.decode(errors='replace')[-2000:]}")
-
-    def measure_many(self, items):
-        items = [it for it in dict((self.key(m, f), (m, f)) for m, f in items).values()
-                 if self.key(*it) not in self._cache]
-        if not items:
-            return
-        # Every item is set twice: as given, and as its plain text.  Matplotlib lays
-        # out with the ink extents of the string (that is what its margins and
-        # alignment are tuned to), a line box is much taller.  So Matplotlib is told
-        # the ink height of the plain text plus whatever the markup adds to the line
-        # box (sub- and superscripts, fractions), and the line box is only used to
-        # place the text.
-        probes = []
-        for markup, font in items:
-            base = _plain_text(markup)
-            probes.append((markup, font["css"]))
-            probes.append((escape(base), font["css"]))
-        boxes = self._probe(probes, [f for _, f in items])
-        for i, (markup, font) in enumerate(items):
-            w, H, D, A = boxes[2 * i]
-            _, Hb, Db, Ab = boxes[2 * i + 1]
-            hi, di = _ink_height_descent(_plain_text(markup), font)
-            up, down = max(0.0, A - Ab), max(0.0, D - Db)
-            key = self.key(markup, font)
-            self._cache[key] = (w, hi + up + down, di + down)
-            self._ascent[key] = (A, H)
-
-    def _probe(self, probes, fonts=()):
-        """[(markup, css)] -> [(width, height, descent, ascent)] of the line boxes."""
-        rows = [f'<div id="p{i}" style="{css}"><span id="s{i}" '
-                f'style="display:inline-block;width:0;height:0"></span>{markup}</div>'
-                for i, (markup, css) in enumerate(probes)]
-        doc = (f'<html xmlns="{XHTML}"><head><style>' +
-               _font_face_css(fonts, math=any("<math" in m for m, _ in probes)) +
-               "@page{size:20000px 20000px;margin:0}"
-               "html,body{margin:0;padding:0}"
-               "div{position:absolute;left:0;top:0;white-space:pre;line-height:normal}"
-               "</style></head><body>" + "".join(rows) + "</body></html>")
-        with tempfile.TemporaryDirectory() as d:
-            src, dump, pdf = (os.path.join(d, n) for n in ("probe.xhtml", "probe.json", "probe.pdf"))
-            with open(src, "w", encoding="utf-8") as fh:
-                fh.write(doc)
-            self._run("--dump-layout", dump, src, pdf)
-            with open(dump, encoding="utf-8") as fh:
-                tree = json.load(fh)["document"]
-        found = {}
-
-        def walk(n):
-            if n.get("id"):
-                found[n["id"]] = n
-            for c in n.get("children", ()):
-                walk(c)
-        walk(tree)
-        out = []
-        for i in range(len(probes)):
-            p, s = found[f"p{i}"], found[f"s{i}"]
-            w, h = p["content_box"]["width"], p["content_box"]["height"]
-            asc = s["border_box"]["y"] - p["content_box"]["y"]
-            out.append((w, h, h - asc, asc))
-        return out
-
-    def render(self, svg, width, height):
-        with tempfile.TemporaryDirectory() as d:
-            src, pdf = os.path.join(d, "figure.svg"), os.path.join(d, "figure.pdf")
-            with open(src, "w", encoding="utf-8") as fh:
-                fh.write(svg)
-            self._run(src, pdf)
-            with open(pdf, "rb") as fh:
-                return fh.read()
-
-
 class UmbruchServer(UmbruchBridge):
     """Bridge to one long-lived ``umbruch --serve`` process (protocol version 1).
 
@@ -519,17 +422,16 @@ def find_umbruch():
 
 
 def get_bridge():
+    """The bridge to the umbruch server (started on first use).  There is no fallback to
+    another way of running umbruch: if it cannot be found or started, this raises."""
     if config.bridge is None:
         exe = find_umbruch()
         if exe is None:
-            return None
+            raise RuntimeError("umbruch executable not found: pip install umbruch, put it on "
+                               "PATH, or set $UMBRUCH (or umbruch_matplotlib.config.bridge)")
         server = UmbruchServer(exe)
-        try:
-            server._start()
-            config.bridge = server
-        except Exception as e:
-            log.info("umbruch --serve is not available (%s); one process per batch", e)
-            config.bridge = UmbruchCli(exe)
+        server._start()
+        config.bridge = server
     return config.bridge
 
 
@@ -820,7 +722,7 @@ class RendererUmbruch(RendererSVG):
         w, h, d = self.bridge.measure(markup, font)
         asc, box_h = self.bridge.ascent(markup, font)
         alpha = gc.get_alpha() if gc.get_forced_alpha() else gc.get_rgb()[3]
-        # the same declarations as the probe of UmbruchCli.measure_many, plus paint
+        # the same declarations as the probes of the measure op, plus paint
         pad = 0.25 * font["size"]
         style = (f"margin:{_fmt(pad)}px 0 0 {_fmt(pad)}px;padding:0;"
                  f"white-space:pre;line-height:normal;"
@@ -962,8 +864,7 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def print_svg(self, filename, *, bbox_inches_restore=None, metadata=None,
                   **kwargs):
         bridge = get_bridge()
-        if bridge is not None:
-            self._prefetch(bridge)
+        self._prefetch(bridge)
         with cbook.open_file_cm(filename, "w", encoding="utf-8") as fh:
             if not cbook.file_requires_unicode(fh):
                 import codecs
@@ -973,10 +874,6 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def print_pdf(self, filename, *, bbox_inches_restore=None, metadata=None,
                   **kwargs):
         bridge = get_bridge()
-        if bridge is None:
-            raise RuntimeError(
-                "umbruch executable not found: pip install umbruch, put it on PATH, "
-                "or set $UMBRUCH (or umbruch_matplotlib.config.bridge)")
         self._prefetch(bridge)
         buf = io.StringIO()
         w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)

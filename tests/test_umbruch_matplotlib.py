@@ -195,6 +195,19 @@ def test_unknown_math_font_raises(math_font):
         _math()
 
 
+def test_no_fallback_when_the_server_cannot_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(hb.config, "bridge", None)
+    monkeypatch.setenv("UMBRUCH", str(tmp_path / "no-such-umbruch"))
+    fig, ax = plt.subplots()
+    ax.set_title("x")
+    with pytest.raises(OSError):
+        fig.savefig(io.BytesIO(), format="pdf")
+    monkeypatch.setattr(hb, "find_umbruch", lambda: None)
+    with pytest.raises(RuntimeError, match="not found"):
+        fig.savefig(io.BytesIO(), format="svg")
+    plt.close(fig)
+
+
 # -- against the real umbruch ---------------------------------------------------
 
 @need_umbruch
