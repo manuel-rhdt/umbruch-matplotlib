@@ -803,13 +803,33 @@ class _RawWriter(_XMLWriter):
 
 class RendererUmbruch(RendererSVG):
     def __init__(self, width, height, svgwriter, basename=None, image_dpi=72,
-                 *, metadata=None, bridge):
+                 *, metadata=None, bridge, color_space=None):
         super().__init__(width, height, svgwriter, basename, image_dpi,
                          metadata=metadata)
         self.writer.__class__ = _RawWriter
         self.bridge = bridge
+        self.color_space = color_space
         self._fonts = {}
         self._math = False
+
+    # -- colors -------------------------------------------------------------
+
+    def _css_color(self, rgb):
+        """*rgb* as a CSS color: in the figure's color space at full precision (stock
+        SVG writes hex, which rounds to 1/255), or as hex for sRGB."""
+        if self.color_space in (None, "srgb"):
+            return rgb2hex(rgb)
+        return "color({} {})".format(self.color_space,
+                                     " ".join(f"{float(v):.6g}" for v in rgb[:3]))
+
+    def _get_style_dict(self, gc, rgbFace):
+        attrib = super()._get_style_dict(gc, rgbFace)
+        if self.color_space not in (None, "srgb"):
+            if attrib.get("fill", "").startswith("#"):
+                attrib["fill"] = self._css_color(rgbFace)
+            if attrib.get("stroke", "").startswith("#"):
+                attrib["stroke"] = self._css_color(gc.get_rgb())
+        return attrib
 
     # -- text ---------------------------------------------------------------
 
@@ -863,7 +883,7 @@ class RendererUmbruch(RendererSVG):
         pad = 0.25 * font["size"]
         style = (f"margin:{_fmt(pad)}px 0 0 {_fmt(pad)}px;padding:0;"
                  f"white-space:pre;line-height:normal;"
-                 f"{font['css']};color:{rgb2hex(gc.get_rgb())}")
+                 f"{font['css']};color:{self._css_color(gc.get_rgb())}")
         if alpha != 1:
             style += f";opacity:{_fmt(alpha)}"
         div = f'<div xmlns="{XHTML}" style="{style}">{markup}</div>'
@@ -928,13 +948,13 @@ class RendererUmbruch(RendererSVG):
         if seam and rgba[3] >= 1:
             # a hairline of the same color hides the seams that antialiasing leaves
             # between flat neighbours
-            attrib.update({"stroke": rgb2hex(rgba[:3]), "stroke-width": "0.4",
+            attrib.update({"stroke": self._css_color(rgba[:3]), "stroke-width": "0.4",
                            "stroke-linejoin": "round"})
         else:
             attrib["stroke"] = "none"
         self.writer.element(
             "path", d="M{} {}L{} {}L{} {}Z".format(*(_fmt(v) for v in p.ravel())),
-            fill=rgb2hex(rgba[:3]), attrib=attrib)
+            fill=self._css_color(rgba[:3]), attrib=attrib)
 
     def _subdivided(self, p, c):
         """Approximate a Gouraud triangle by flat ones: n*n sub-triangles, each in the
@@ -969,14 +989,15 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def get_default_filetype(self):
         return "pdf"
 
-    def _draw_to(self, fh, bridge, bbox_inches_restore, metadata):
+    def _draw_to(self, fh, bridge, bbox_inches_restore, metadata, color_space=None):
         dpi = self.figure.dpi
         self.figure.dpi = 72
         width, height = self.figure.get_size_inches()
         w, h = width * 72, height * 72
         renderer = MixedModeRenderer(
             self.figure, width, height, dpi,
-            RendererUmbruch(w, h, fh, image_dpi=dpi, metadata=metadata, bridge=bridge),
+            RendererUmbruch(w, h, fh, image_dpi=dpi, metadata=metadata, bridge=bridge,
+                            color_space=color_space),
             bbox_inches_restore=bbox_inches_restore)
         self.figure.draw(renderer)
         renderer.finalize()
@@ -996,9 +1017,13 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
             bridge.measure_many(list(pending.values()))
 
     def _svg_text(self, bridge, bbox_inches_restore, metadata, color_space):
-        buf = io.StringIO()
-        size = self._draw_to(buf, bridge, bbox_inches_restore, metadata)
         space = color_space or config.color_space
+        if space is not None:
+            _space(space)
+        buf = io.StringIO()
+        size = self._draw_to(buf, bridge, bbox_inches_restore, metadata, space)
+        # what the renderer wrote precisely stays; this catches the hex colors of stock
+        # SVG that it does not override (hatches, stock Gouraud), and tags the images
         return _apply_color_space(buf.getvalue(), space), size
 
     def print_svg(self, filename, *, bbox_inches_restore=None, metadata=None,

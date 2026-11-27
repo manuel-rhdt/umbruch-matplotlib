@@ -228,6 +228,23 @@ def test_color_space_rewrites_painted_colors_only():
     assert hb._apply_color_space(svg, None) == svg == hb._apply_color_space(svg, "srgb")
 
 
+def test_painted_colors_keep_full_precision(dummy_bridge, tmp_path):
+    from matplotlib.patches import Rectangle
+    fig, ax = plt.subplots()
+    ax.add_patch(Rectangle((0, 0), 1, 1, facecolor=(0.1234567, 0.5, 0.9),
+                           edgecolor=(0.7654321, 0.2, 0.1), linewidth=2))
+    ax.set_title("t", color=(0.3333333, 0.6666667, 0.0123457))
+    for space, spaced in (("display-p3", True), ("srgb", False)):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="svg", color_space=space)
+        svg = buf.getvalue().decode()
+        assert ("color(display-p3 0.123457 0.5 0.9)" in svg) == spaced, space
+        assert ("color(display-p3 0.765432 0.2 0.1)" in svg) == spaced, space
+        assert ("color:color(display-p3 0.333333 0.666667 0.0123457)" in svg) == spaced
+        assert (matplotlib.colors.rgb2hex((0.1234567, 0.5, 0.9)) in svg) == (not spaced), space
+    plt.close(fig)
+
+
 def test_color_space_tags_png_images():
     import base64
     from PIL import Image
@@ -445,3 +462,28 @@ def test_images_agree_with_flat_colors_in_the_color_space(real_bridge, tmp_path,
     rgb = (0.1, 0.9, 0.3)
     a, b = _pixel(tmp_path, _flat(rgb), "flat", space), _pixel(tmp_path, _image(rgb), "img", space)
     assert np.abs(a - b).max() <= 3, (space, a, b)
+
+
+def _content_streams(pdf):
+    out = []
+    for m in re.finditer(rb"stream\r?\n(.*?)endstream", pdf, re.S):
+        try:
+            out.append(zlib.decompress(m.group(1)))
+        except zlib.error:
+            pass
+    return b"".join(out)
+
+
+@need_umbruch
+def test_precise_colors_reach_the_pdf(real_bridge):
+    """The PDF has the components as given (0.1234567), not rounded to 1/255 steps."""
+    from matplotlib.patches import Rectangle
+    fig = plt.figure(figsize=(1, 1))
+    fig.add_artist(Rectangle((0.1, 0.1), 0.8, 0.8, facecolor=(0.1234567, 0.5, 0.9),
+                             transform=fig.transFigure))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="pdf", color_space="display-p3")
+    content = _content_streams(buf.getvalue())
+    colors = [[float(x) for x in m.split()]
+              for m in re.findall(rb"/CS\d+ cs ([\d. ]+) sc", content)]
+    assert any(c == pytest.approx([0.1234567, 0.5, 0.9], abs=2e-6) for c in colors), colors
