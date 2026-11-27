@@ -186,9 +186,6 @@ class UmbruchBridge:
     """What the backend needs from a renderer.  Units are SVG user units, which are
     CSS px inside a foreignObject and, in Matplotlib's SVG, points."""
 
-    #: If False, text is delegated to the stock SVG renderer.
-    handles_text = True
-
     def __init__(self):
         self._cache = {}     # key -> (w, h, d) as Matplotlib should see it
         self._ascent = {}    # key -> distance from the top of the line box to the baseline
@@ -652,7 +649,7 @@ class _RawWriter(_XMLWriter):
 
 class RendererUmbruch(RendererSVG):
     def __init__(self, width, height, svgwriter, basename=None, image_dpi=72,
-                 *, metadata=None, bridge=None):
+                 *, metadata=None, bridge):
         super().__init__(width, height, svgwriter, basename, image_dpi,
                          metadata=metadata)
         self.writer.__class__ = _RawWriter
@@ -661,9 +658,6 @@ class RendererUmbruch(RendererSVG):
         self._math = False
 
     # -- text ---------------------------------------------------------------
-
-    def _handles_text(self):
-        return self.bridge is not None and self.bridge.handles_text
 
     def _markup(self, s, ismath):
         """Inline XHTML/MathML for *s*.  What umbruch cannot set is an error: there is
@@ -699,21 +693,10 @@ class RendererUmbruch(RendererSVG):
         out.append(esc(s[pos:]).replace(r"\$", "$"))
         return "".join(out)
 
-    def _degrade(self, s):
-        """Without umbruch text support, rich markup is reduced to plain text."""
-        if isinstance(s, str) and s.startswith(RICH_MARK):
-            return _TAG_RE.sub("", s[1:])
-        return s
-
     def get_text_width_height_descent(self, s, prop, ismath):
-        if not self._handles_text():
-            return super().get_text_width_height_descent(self._degrade(s), prop, ismath)
         return self.bridge.measure(self._markup(s, ismath), _font_spec(prop))
 
     def draw_text(self, gc, x, y, s, prop, angle, ismath=False, mtext=None):
-        if not self._handles_text():
-            return super().draw_text(gc, x, y, self._degrade(s), prop, angle,
-                                     ismath, mtext)
         markup = self._markup(s, ismath)
         font = _font_spec(prop)
         if font["face"]:
@@ -762,9 +745,8 @@ class RendererUmbruch(RendererSVG):
     def draw_gouraud_triangles(self, gc, triangles_array, colors_array, transform):
         mode = config.gouraud
         if mode == "auto":
-            mode = "native" if (self.bridge is not None and
-                                "mesh_gouraud" in self.bridge.capabilities) else "subdivide"
-        if self.bridge is None or mode == "stock":
+            mode = "native" if "mesh_gouraud" in self.bridge.capabilities else "subdivide"
+        if mode == "stock":
             return super().draw_gouraud_triangles(gc, triangles_array, colors_array,
                                                   transform)
         wr = self.writer
@@ -849,8 +831,6 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def _prefetch(self, bridge):
         """Draw to nowhere to collect the strings, measure them in one batch, repeat
         until a drawing needs nothing new (layout can change the strings, e.g. ticks)."""
-        if not bridge.handles_text:
-            return
         for _ in range(4):
             bridge._collect = {}
             try:
