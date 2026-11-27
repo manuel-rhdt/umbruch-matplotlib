@@ -19,6 +19,11 @@ differ from stock SVG output:
   umbruch paints as a single type 4 shading.  This is an umbruch extension of SVG that no
   other renderer draws.  ``"subdivide"`` (flat sub-triangles) and ``"stock"``
   (Matplotlib's gradient emulation) are polyfills for other renderers.
+* Fonts: the file that Matplotlib's font manager picks for each text is sent to
+  umbruch as an @font-face with a data: URI (in the SVG, and in measure requests),
+  under a name derived from the file; the font's own family list follows as fallback.
+  The font of math (``config.math_font``, or ``mathtext.fontset``) is set by a style
+  attribute on each <math>, since a style sheet would not reach the probes of a measure.
 * The finished SVG is rendered to PDF by ``umbruch figure.svg figure.pdf``.
 
 Usage
@@ -30,16 +35,20 @@ Usage
     ax.set_xlabel(r"$\alpha^2$ (needs the latex2mathml package)")
     fig.savefig("out.pdf")
 
-The ``umbruch`` executable is taken from $UMBRUCH or PATH.  Rich text is marked by
+The ``umbruch`` executable is taken from $UMBRUCH, the ``umbruch`` package or PATH.  Rich text is marked by
 a leading U+FEFF (see ``rich``), which survives Matplotlib's string handling.
 The markup must be well-formed XML (numeric entities, not &nbsp;), and a newline
 splits lines as for any Matplotlib text.  ``$...$`` in a plain or rich string is
 converted to MathML by ``config.tex_to_mathml`` (default: latex2mathml).  Math
-that cannot be converted falls back to Matplotlib's own mathtext, drawn as paths.
+that cannot be converted raises, as does ``text.usetex``; there is no fallback to
+Matplotlib's own text rendering.
 
-Tested against Matplotlib 3.11 and umbruch 0.4.2 (7c77f07); it uses a few private
-attributes of the SVG renderer.
+Tested against Matplotlib 3.11 and umbruch 0.5; it uses a few private attributes of
+the SVG renderer.
 """
+import base64
+import functools
+import hashlib
 import io
 import json
 import os
@@ -122,15 +131,24 @@ def _fix_mathml(ml):
             el.tag = ns + "mo"
         elif tag == "mo" and txt == ".":
             el.tag = ns + "mi"
-    for parent in root.iter():
-        kids = list(parent)
-        for i in range(len(kids) - 1, -1, -1):
-            el = kids[i]
-            if el.tag.rsplit("}", 1)[-1] == "mi" and (el.text or "") in _FUNCTIONS \
-                    and i + 1 < len(kids) and kids[i + 1].tag.rsplit("}", 1)[-1] != "mo":
-                fa = ET.Element(ns + "mo")
-                fa.text = "\u2061"
-                parent.insert(i + 1, fa)
+    # Function application goes after the function, which for \sin^2 means after the
+    # whole <msup>: inside it, the script would get three children.
+    parents = {child: parent for parent in root.iter() for child in parent}
+    local = lambda e: e.tag.rsplit("}", 1)[-1]
+    funcs = [el for el in root.iter() if local(el) == "mi" and (el.text or "") in _FUNCTIONS]
+    for el in reversed(funcs):
+        target = el
+        while target in parents and local(parents[target]) in _ARITY \
+                and parents[target][0] is target:
+            target = parents[target]
+        parent = parents.get(target)
+        if parent is None:
+            continue
+        i = list(parent).index(target)
+        if i + 1 < len(parent) and local(parent[i + 1]) != "mo":
+            fa = ET.Element(ns + "mo")
+            fa.text = "\u2061"
+            parent.insert(i + 1, fa)
     return ET.tostring(root, encoding="unicode")
 
 
@@ -144,11 +162,11 @@ def _default_tex_to_mathml(tex):
 
 
 class _Config:
-    #: UmbruchBridge instance; if None, UMBRUCH_CMD / UMBRUCH_MEASURE_CMD are used.
+    #: UmbruchBridge instance; if None, one is created for the umbruch executable
+    #: found by ``find_umbruch``.
     bridge = None
-    #: callable(tex: str) -> MathML string, or None to use latex2mathml if present.
-    #: Without any converter, math falls back to Matplotlib's own mathtext, drawn
-    #: as paths by the SVG renderer.
+    #: callable(tex: str) -> MathML string, or None to use latex2mathml (an error
+    #: if that is not installed).
     tex_to_mathml = None
     #: "native" (default): the mesh is one compact ``<g data-umbruch-mesh="gouraud">``
     #: element that umbruch writes as a single type 4 shading.  This is an umbruch
@@ -159,6 +177,11 @@ class _Config:
     #: renderer reports mesh_gouraud, else "subdivide".
     gouraud = "native"
     gouraud_max_level = 8
+    #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
+    #: Modern Math", or any OpenType math font Matplotlib finds) or the path of a font
+    #: file.  None follows ``mathtext.fontset``: "cm" is Latin Modern Math, anything
+    #: else STIX Two Math.
+    math_font = None
 
 
 config = _Config()
@@ -167,9 +190,6 @@ config = _Config()
 class UmbruchBridge:
     """What the backend needs from a renderer.  Units are SVG user units, which are
     CSS px inside a foreignObject and, in Matplotlib's SVG, points."""
-
-    #: If False, text is delegated to the stock SVG renderer.
-    handles_text = True
 
     def __init__(self):
         self._cache = {}     # key -> (w, h, d) as Matplotlib should see it
@@ -221,102 +241,6 @@ class UmbruchBridge:
         pass
 
 
-class UmbruchCli(UmbruchBridge):
-    """Bridge to the ``umbruch`` executable as it is today.
-
-    Rendering: ``umbruch in.svg out.pdf`` (an SVG file is one page of the size of
-    the drawing; foreignObject holds HTML and MathML).
-
-    Measuring: there is no measuring mode, so a batch of strings is set in an XHTML
-    document, one absolutely positioned block each, and ``--dump-layout`` gives the
-    boxes.  A zero-size inline-block in front of the text sits on the first baseline,
-    which gives the ascent.  One process answers a whole batch (about 20 ms), and the
-    canvas collects the strings of a figure first (``_prefetch``), so the cost is per
-    figure and not per label.
-    """
-
-    def __init__(self, executable="umbruch", args=("--no-system-fonts",), timeout=120):
-        super().__init__()
-        self.executable = executable
-        self.args = list(args)
-        self.timeout = timeout
-
-    def _run(self, *argv):
-        p = subprocess.run([self.executable, *self.args, *argv], capture_output=True,
-                           timeout=self.timeout, check=False)
-        if p.returncode:
-            raise RuntimeError(f"umbruch failed ({p.returncode}): "
-                               f"{p.stderr.decode(errors='replace')[-2000:]}")
-
-    def measure_many(self, items):
-        items = [it for it in dict((self.key(m, f), (m, f)) for m, f in items).values()
-                 if self.key(*it) not in self._cache]
-        if not items:
-            return
-        # Every item is set twice: as given, and as its plain text.  Matplotlib lays
-        # out with the ink extents of the string (that is what its margins and
-        # alignment are tuned to), a line box is much taller.  So Matplotlib is told
-        # the ink height of the plain text plus whatever the markup adds to the line
-        # box (sub- and superscripts, fractions), and the line box is only used to
-        # place the text.
-        probes = []
-        for markup, font in items:
-            base = _plain_text(markup)
-            probes.append((markup, font["css"]))
-            probes.append((escape(base), font["css"]))
-        boxes = self._probe(probes)
-        for i, (markup, font) in enumerate(items):
-            w, H, D, A = boxes[2 * i]
-            _, Hb, Db, Ab = boxes[2 * i + 1]
-            hi, di = _ink_height_descent(_plain_text(markup), font)
-            up, down = max(0.0, A - Ab), max(0.0, D - Db)
-            key = self.key(markup, font)
-            self._cache[key] = (w, hi + up + down, di + down)
-            self._ascent[key] = (A, H)
-
-    def _probe(self, probes):
-        """[(markup, css)] -> [(width, height, descent, ascent)] of the line boxes."""
-        rows = [f'<div id="p{i}" style="{css}"><span id="s{i}" '
-                f'style="display:inline-block;width:0;height:0"></span>{markup}</div>'
-                for i, (markup, css) in enumerate(probes)]
-        doc = (f'<html xmlns="{XHTML}"><head><style>'
-               "@page{size:20000px 20000px;margin:0}"
-               "html,body{margin:0;padding:0}"
-               "div{position:absolute;left:0;top:0;white-space:pre;line-height:normal}"
-               "</style></head><body>" + "".join(rows) + "</body></html>")
-        with tempfile.TemporaryDirectory() as d:
-            src, dump, pdf = (os.path.join(d, n) for n in ("probe.xhtml", "probe.json", "probe.pdf"))
-            with open(src, "w", encoding="utf-8") as fh:
-                fh.write(doc)
-            self._run("--dump-layout", dump, src, pdf)
-            with open(dump, encoding="utf-8") as fh:
-                tree = json.load(fh)["document"]
-        found = {}
-
-        def walk(n):
-            if n.get("id"):
-                found[n["id"]] = n
-            for c in n.get("children", ()):
-                walk(c)
-        walk(tree)
-        out = []
-        for i in range(len(probes)):
-            p, s = found[f"p{i}"], found[f"s{i}"]
-            w, h = p["content_box"]["width"], p["content_box"]["height"]
-            asc = s["border_box"]["y"] - p["content_box"]["y"]
-            out.append((w, h, h - asc, asc))
-        return out
-
-    def render(self, svg, width, height):
-        with tempfile.TemporaryDirectory() as d:
-            src, pdf = os.path.join(d, "figure.svg"), os.path.join(d, "figure.pdf")
-            with open(src, "w", encoding="utf-8") as fh:
-                fh.write(svg)
-            self._run(src, pdf)
-            with open(pdf, "rb") as fh:
-                return fh.read()
-
-
 class UmbruchServer(UmbruchBridge):
     """Bridge to one long-lived ``umbruch --serve`` process (protocol version 1).
 
@@ -337,6 +261,7 @@ class UmbruchServer(UmbruchBridge):
         self._proc = None
         self._lock = threading.RLock()
         self._next_id = 0
+        self._pid = None
         atexit.register(self.close)
 
     # -- process and framing -------------------------------------------------
@@ -360,6 +285,7 @@ class UmbruchServer(UmbruchBridge):
             self._kill()
             raise RuntimeError(f"umbruch --serve lacks {sorted(missing)}")
         self.version = hello.get("umbruch")
+        self._pid = os.getpid()
 
     def _kill(self):
         p, self._proc = self._proc, None
@@ -409,6 +335,14 @@ class UmbruchServer(UmbruchBridge):
 
     def request(self, op, params):
         with self._lock:
+            if self._proc is not None and self._pid != os.getpid():
+                # forked child: the pipes belong to the parent's conversation
+                for f in (self._proc.stdin, self._proc.stdout):
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+                self._proc = None
             for attempt in (0, 1):
                 try:
                     if self._proc is None or self._proc.poll() is not None:
@@ -426,9 +360,13 @@ class UmbruchServer(UmbruchBridge):
                  if self.key(*it) not in self._cache]
         for start in range(0, len(items), self.BATCH):
             chunk = items[start:start + self.BATCH]
-            result, _ = self.request("measure", {"probes": [
+            # @font-face rules apply to the probes of the same request
+            rules = _font_face_css((f for _, f in chunk),
+                                   math=any("<math" in m for m, _ in chunk))
+            head = [{"markup": f"<style>{rules}</style>", "css": ""}] if rules else []
+            result, _ = self.request("measure", {"probes": head + [
                 {"markup": m, "css": f["css"]} for m, f in chunk]})
-            for (markup, font), m in zip(chunk, result["metrics"]):
+            for (markup, font), m in zip(chunk, result["metrics"][len(head):]):
                 if "error" in m:
                     raise RuntimeError(f"umbruch could not measure {markup!r}: {m['error']}")
                 ink = m["ink"]
@@ -486,23 +424,106 @@ def find_umbruch():
 
 
 def get_bridge():
+    """The bridge to the umbruch server (started on first use).  There is no fallback to
+    another way of running umbruch: if it cannot be found or started, this raises."""
     if config.bridge is None:
         exe = find_umbruch()
         if exe is None:
-            return None
+            raise RuntimeError("umbruch executable not found: pip install umbruch, put it on "
+                               "PATH, or set $UMBRUCH (or umbruch_matplotlib.config.bridge)")
         server = UmbruchServer(exe)
-        try:
-            server._start()
-            config.bridge = server
-        except Exception as e:
-            log.info("umbruch --serve is not available (%s); one process per batch", e)
-            config.bridge = UmbruchCli(exe)
+        server._start()
+        config.bridge = server
     return config.bridge
 
 
+@functools.lru_cache(maxsize=None)
+def _font_data_uri(path):
+    with open(path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode("ascii")
+    return f"data:{'font/otf' if path.lower().endswith('.otf') else 'font/ttf'};base64,{data}"
+
+
+@functools.lru_cache(maxsize=None)
+def _face_of(path):
+    """The face Matplotlib found at *path*, as a description for @font-face."""
+    entry = next((e for e in fm.fontManager.ttflist if e.fname == path), None)
+    weight = int(fm.weight_dict.get(entry.weight, entry.weight)) if entry else None
+    ident = f"{path}:{os.path.getmtime(path)}"
+    return {"alias": "mpl-" + hashlib.sha1(ident.encode()).hexdigest()[:12], "path": path,
+            "weight": weight, "style": entry.style if entry else None}
+
+
+def _face_css(faces):
+    return "".join(
+        f"@font-face{{font-family:'{f['alias']}';font-weight:{f['weight']};"
+        f"font-style:{f['style']};src:url({_font_data_uri(f['path'])})}}"
+        for f in {f["alias"]: f for f in faces}.values())
+
+
+def _font_face_css(fonts, math=False):
+    """@font-face rules (the font files as data: URIs) for the fonts of *fonts*, and for
+    the math font if *math* and it is a file."""
+    faces = [f["face"] for f in fonts if f.get("face")]
+    if math:
+        faces.append(_math_font()[1])
+    return _face_css(f for f in faces if f)
+
+
+_MATH_BUNDLED = {"stix two math", "latin modern math"}
+
+
+def _math_font():
+    """(CSS font-family value, face to embed or None) of the math font."""
+    value = config.math_font
+    if value is None:
+        value = "Latin Modern Math" if mpl.rcParams["mathtext.fontset"] == "cm" else None
+    return _math_font_for(value)
+
+
+@functools.lru_cache(maxsize=None)
+def _math_font_for(value):
+    if value is None:
+        return None, None
+    if value.lower() in _MATH_BUNDLED:
+        return repr(value), None
+    path = value if os.path.isfile(value) else None
+    if path is None:
+        try:
+            path = fm.findfont(fm.FontProperties(family=value), fallback_to_default=False)
+        except ValueError:
+            raise ValueError(f"math font {value!r} not found: give the family of an "
+                             "OpenType math font Matplotlib can find, or a file") from None
+    ident = f"{path}:{os.path.getmtime(path)}"
+    face = {"alias": "mpl-math-" + hashlib.sha1(ident.encode()).hexdigest()[:12],
+            "path": path, "weight": 400, "style": "normal"}
+    return repr(face["alias"]), face
+
+
+def _style_math(ml):
+    """Set the math font on the <math> elements of *ml* (a rule in a style sheet would
+    not reach the probes of a measure request, a style attribute does)."""
+    family = _math_font()[0]
+    if family is None:
+        return ml
+    return re.sub(r"<math\b", f'<math style="font-family:{family}"', ml)
+
+
 def _font_spec(prop):
+    """What the renderer needs to set text in *prop*: the CSS, and the font file that
+    Matplotlib itself would use, which is sent along as an @font-face (umbruch cannot
+    see the system's fonts, and this way it sets exactly the face Matplotlib measured
+    for).  The families of *prop* follow as fallbacks."""
     weight = prop.get_weight()
     weight = fm.weight_dict.get(weight, weight)
+    try:
+        face = _face_of(fm.findfont(prop))
+    except (ValueError, OSError):
+        face = None
+    if face and face["weight"] is not None:
+        weight, style = face["weight"], face["style"]
+    else:
+        face, style = None, prop.get_style()
     names = []
     for entry in prop.get_family():
         entry = "sans-serif" if entry in ("sans", "sans serif") else entry
@@ -513,11 +534,13 @@ def _font_spec(prop):
     names = list(dict.fromkeys(names))
     quoted = [n if n in fm.font_family_aliases or n == "sans-serif" else repr(n)
               for n in names]
+    if face:
+        quoted.insert(0, repr(face["alias"]))
     return {"prop": prop, "family": names, "size": float(prop.get_size()), "weight": int(weight),
-            "style": prop.get_style(), "variant": prop.get_variant(),
+            "face": face, "style": style, "variant": prop.get_variant(),
             "stretch": prop.get_stretch(),
             "css": (f"font-family:{', '.join(quoted)};font-size:{_fmt(prop.get_size())}px;"
-                    f"font-weight:{int(weight)};font-style:{prop.get_style()};"
+                    f"font-weight:{int(weight)};font-style:{style};"
                     f"font-variant:{prop.get_variant()}"
                     + ("" if prop.get_stretch() == "normal" else
                        f";font-stretch:{prop.get_stretch()}"))}
@@ -631,16 +654,15 @@ class _RawWriter(_XMLWriter):
 
 class RendererUmbruch(RendererSVG):
     def __init__(self, width, height, svgwriter, basename=None, image_dpi=72,
-                 *, metadata=None, bridge=None):
+                 *, metadata=None, bridge):
         super().__init__(width, height, svgwriter, basename, image_dpi,
                          metadata=metadata)
         self.writer.__class__ = _RawWriter
         self.bridge = bridge
+        self._fonts = {}
+        self._math = False
 
     # -- text ---------------------------------------------------------------
-
-    def _handles_text(self):
-        return self.bridge is not None and self.bridge.handles_text
 
     def _markup(self, s, ismath):
         """Inline XHTML/MathML for *s*.  What umbruch cannot set is an error: there is
@@ -671,32 +693,24 @@ class RendererUmbruch(RendererSVG):
                 raise RuntimeError(f"cannot convert math {m.group(1)!r} to MathML: the "
                                    "converter returned None")
             out.append(esc(s[pos:m.start()]).replace(r"\$", "$"))
-            out.append(ml)
+            out.append(_style_math(ml))
             pos = m.end()
         out.append(esc(s[pos:]).replace(r"\$", "$"))
         return "".join(out)
 
-    def _degrade(self, s):
-        """Without umbruch text support, rich markup is reduced to plain text."""
-        if isinstance(s, str) and s.startswith(RICH_MARK):
-            return _TAG_RE.sub("", s[1:])
-        return s
-
     def get_text_width_height_descent(self, s, prop, ismath):
-        if not self._handles_text():
-            return super().get_text_width_height_descent(self._degrade(s), prop, ismath)
         return self.bridge.measure(self._markup(s, ismath), _font_spec(prop))
 
     def draw_text(self, gc, x, y, s, prop, angle, ismath=False, mtext=None):
-        if not self._handles_text():
-            return super().draw_text(gc, x, y, self._degrade(s), prop, angle,
-                                     ismath, mtext)
         markup = self._markup(s, ismath)
         font = _font_spec(prop)
+        if font["face"]:
+            self._fonts[font["face"]["alias"]] = font
+        self._math = self._math or "<math" in markup
         w, h, d = self.bridge.measure(markup, font)
         asc, box_h = self.bridge.ascent(markup, font)
         alpha = gc.get_alpha() if gc.get_forced_alpha() else gc.get_rgb()[3]
-        # the same declarations as the probe of UmbruchCli.measure_many, plus paint
+        # the same declarations as the probes of the measure op, plus paint
         pad = 0.25 * font["size"]
         style = (f"margin:{_fmt(pad)}px 0 0 {_fmt(pad)}px;padding:0;"
                  f"white-space:pre;line-height:normal;"
@@ -723,21 +737,28 @@ class RendererUmbruch(RendererSVG):
         if clip:
             wr.end("g")
 
+    def finalize(self):
+        rules = _font_face_css(self._fonts.values(), math=self._math)
+        if rules:
+            self.writer.start("style")
+            self.writer.data(rules)
+            self.writer.end("style")
+        super().finalize()
+
     # -- meshes -------------------------------------------------------------
 
     def draw_gouraud_triangles(self, gc, triangles_array, colors_array, transform):
         mode = config.gouraud
         if mode == "auto":
-            mode = "native" if (self.bridge is not None and
-                                "mesh_gouraud" in self.bridge.capabilities) else "subdivide"
-        if self.bridge is None or mode == "stock":
+            mode = "native" if "mesh_gouraud" in self.bridge.capabilities else "subdivide"
+        if mode == "stock":
             return super().draw_gouraud_triangles(gc, triangles_array, colors_array,
                                                   transform)
         if (mode == "native" and self.bridge.capabilities
                 and "mesh_gouraud" not in self.bridge.capabilities):
             log.warning("this umbruch lacks the mesh_gouraud capability: its Gouraud "
-                         "meshes are not drawn; update umbruch or set "
-                         "config.gouraud = 'subdivide'")
+                        "meshes are not drawn; update umbruch or set "
+                        "config.gouraud = 'subdivide'")
         wr = self.writer
         trans = self._make_flip_transform(transform.frozen())
         cols = np.asarray(colors_array, dtype=float)
@@ -831,8 +852,6 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def _prefetch(self, bridge):
         """Draw to nowhere to collect the strings, measure them in one batch, repeat
         until a drawing needs nothing new (layout can change the strings, e.g. ticks)."""
-        if not bridge.handles_text:
-            return
         for _ in range(4):
             bridge._collect = {}
             try:
@@ -846,8 +865,7 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def print_svg(self, filename, *, bbox_inches_restore=None, metadata=None,
                   **kwargs):
         bridge = get_bridge()
-        if bridge is not None:
-            self._prefetch(bridge)
+        self._prefetch(bridge)
         with cbook.open_file_cm(filename, "w", encoding="utf-8") as fh:
             if not cbook.file_requires_unicode(fh):
                 import codecs
@@ -857,10 +875,6 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
     def print_pdf(self, filename, *, bbox_inches_restore=None, metadata=None,
                   **kwargs):
         bridge = get_bridge()
-        if bridge is None:
-            raise RuntimeError(
-                "No umbruch bridge: set umbruch_matplotlib.config.bridge, or "
-                "UMBRUCH_CMD and UMBRUCH_MEASURE_CMD")
         self._prefetch(bridge)
         buf = io.StringIO()
         w, h = self._draw_to(buf, bridge, bbox_inches_restore, None)
