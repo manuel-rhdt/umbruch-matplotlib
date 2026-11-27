@@ -81,7 +81,7 @@ def test_malformed_rich_markup_is_reported(dummy_bridge, tmp_path):
         fig.savefig(tmp_path / "bad.pdf")
 
 
-@pytest.mark.parametrize("mode", ["subdivide", "native", "stock"])
+@pytest.mark.parametrize("mode", ["subdivide", "native"])
 def test_gouraud_modes(dummy_bridge, tmp_path, mode):
     hb.config.gouraud = mode
     fig = fig_with_everything()
@@ -90,7 +90,6 @@ def test_gouraud_modes(dummy_bridge, tmp_path, mode):
     t = p.read_text(encoding="utf-8")
     ET.fromstring(t)
     assert ("data-colors" in t) == (mode == "native")
-    assert ("colorAdd" in t) == (mode == "stock")
     assert "foreignObject" in t and "<i>Rate</i> r<sub>0</sub>" in t
 
 
@@ -210,22 +209,41 @@ def test_no_fallback_when_the_server_cannot_start(monkeypatch, tmp_path):
     plt.close(fig)
 
 
-def test_unknown_color_space_raises():
+def test_unknown_gouraud_mode_raises(dummy_bridge):
+    hb.config.gouraud = "stock"
+    fig = fig_with_everything()
+    with pytest.raises(ValueError, match="config.gouraud"):
+        fig.savefig(io.BytesIO(), format="svg")
+
+
+def test_unknown_color_space_raises(dummy_bridge):
+    fig, ax = plt.subplots()
     with pytest.raises(ValueError, match="unknown color space"):
-        hb._apply_color_space("<svg/>", "cie-xyz")
+        fig.savefig(io.BytesIO(), format="svg", color_space="cie-xyz")
+    plt.close(fig)
 
 
-def test_color_space_rewrites_painted_colors_only():
-    svg = ('<path fill="#FF0000" stroke="#00ff00" fill-opacity="0.5"/>'
-           '<g style="color: #0000ff;fill:none"/><stop stop-color="#808080"/>'
-           '<div>#ff0000 in a label</div>')
-    out = hb._apply_color_space(svg, "display-p3")
-    assert 'fill="color(display-p3 1 0 0)"' in out
-    assert 'stroke="color(display-p3 0 1 0)"' in out
-    assert "color: color(display-p3 0 0 1);fill:none" in out
-    assert 'stop-color="color(display-p3 0.50196 0.50196 0.50196)"' in out
-    assert "<div>#ff0000 in a label</div>" in out and 'fill-opacity="0.5"' in out
-    assert hb._apply_color_space(svg, None) == svg == hb._apply_color_space(svg, "srgb")
+def test_no_hex_colors_are_left_in_a_color_space(dummy_bridge):
+    """Everything painted is written in the color space: fills, strokes, text, hatches,
+    gradient seams; no 8-bit hex colors survive in the SVG."""
+    hb.config.gouraud = "subdivide"
+    fig = fig_with_everything()
+    ax = fig.axes[0]
+    ax.bar([0.2], [0.5], hatch="//", facecolor="C1", edgecolor="C2")
+    ax.scatter([0.5], [0.5], c="C3", s=60, marker="s")
+    ax.set_title("t", color=(0.2, 0.4, 0.6))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="svg", color_space="display-p3")
+    svg = buf.getvalue().decode()
+    plt.close(fig)
+    assert "color(display-p3" in svg
+    left = re.findall(r"(?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*[\"']?\s*#[0-9a-fA-F]{6}", svg)
+    assert not left, left[:5]
+    buf = io.BytesIO()
+    fig = fig_with_everything()
+    fig.savefig(buf, format="svg", color_space="srgb")     # the default: stock hex
+    assert re.search(r"#[0-9a-f]{6}", buf.getvalue().decode())
+    plt.close(fig)
 
 
 def test_painted_colors_keep_full_precision(dummy_bridge, tmp_path):
@@ -245,20 +263,27 @@ def test_painted_colors_keep_full_precision(dummy_bridge, tmp_path):
     plt.close(fig)
 
 
-def test_color_space_tags_png_images():
+def test_images_are_written_with_the_profile_of_the_color_space(dummy_bridge):
     import base64
     from PIL import Image
-    buf = io.BytesIO()
-    Image.new("RGBA", (2, 2), (0, 255, 0, 255)).save(buf, "PNG")
-    uri = "data:image/png;base64,\n" + base64.b64encode(buf.getvalue()).decode()
-    out = hb._apply_color_space(f'<image xlink:href="{uri}"/>', "display-p3")
-    png = base64.b64decode(re.search(r"base64,\s*([^\"]+)", out).group(1))
-    im = Image.open(io.BytesIO(png))
-    assert im.info["icc_profile"] == hb._icc_profile("display-p3")
-    assert im.size == (2, 2) and im.getpixel((0, 0)) == (0, 255, 0, 255)
-    # a second pass leaves a tagged image alone
-    assert hb._apply_color_space(out, "display-p3") == out.replace(
-        "color(display-p3", "color(display-p3")
+    fig = plt.figure(figsize=(1, 1))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.imshow(np.zeros((4, 4, 3)) + (0, 1, 0), interpolation="nearest")
+    for space, tagged in (("display-p3", True), ("srgb", False), (None, False)):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="svg", color_space=space)
+        svg = buf.getvalue().decode()
+        png = base64.b64decode(re.search(r"data:image/png;base64,\s*([^\"]+)", svg).group(1))
+        im = Image.open(io.BytesIO(png))
+        assert ("icc_profile" in im.info) == tagged, space
+        if tagged:
+            assert im.info["icc_profile"] == hb._icc_profile(space)
+        assert im.convert("RGB").getpixel((im.size[0] // 2, im.size[1] // 2)) == (0, 255, 0)
+    # an image that has a profile already is left alone
+    uri = re.search(r"data:image/png;base64,\s*[^\"]+", svg).group(0)
+    tagged_uri = hb._tag_png_uri(uri, "display-p3")
+    assert hb._tag_png_uri(tagged_uri, "display-p3") == tagged_uri
+    plt.close(fig)
 
 
 @pytest.mark.parametrize("space", ["display-p3", "a98-rgb", "prophoto-rgb", "rec2020"])
@@ -447,7 +472,11 @@ def _umbruch_reads_image_profiles(bridge):
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"'
            ' width="10" height="10"><image width="10" height="10" xlink:href="data:image/png;'
            f'base64,{base64.b64encode(buf.getvalue()).decode()}"/></svg>')
-    pdf = bridge.render(hb._apply_color_space(svg, "display-p3"), 10, 10)
+    svg = svg.replace(
+        "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+        hb._tag_png_uri("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+                        "display-p3"))
+    pdf = bridge.render(svg, 10, 10)
     return re.search(rb"/Subtype\s*/Image.{0,80}ICCBased", pdf, re.S) is not None
 
 

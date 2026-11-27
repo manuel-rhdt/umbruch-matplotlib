@@ -70,8 +70,9 @@ from matplotlib import cbook, font_manager as fm
 from matplotlib.backend_bases import FigureManagerBase
 from matplotlib.backends.backend_mixed import MixedModeRenderer
 from matplotlib.backends.backend_svg import (
-    FigureCanvasSVG, RendererSVG, _XMLWriter)
+    FigureCanvasSVG, RendererSVG, _XMLWriter, _generate_css)
 from matplotlib.colors import rgb2hex
+from matplotlib.transforms import Affine2D
 
 log = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ class _Config:
     #: "auto": "native" if the renderer reports the mesh_gouraud capability, else
     #: "subdivide"; "subdivide": flat sub-triangles (works with any renderer);
     #: "native": exact vertex colors in data-colors, for a renderer that writes a
-    #: type 4 shading; "stock": Matplotlib's three-gradient filter emulation.
+    #: type 4 shading.
     gouraud = "auto"
     gouraud_max_level = 8
     #: Font of ``$...$`` math: a family name (umbruch's own "STIX Two Math" and "Latin
@@ -304,36 +305,21 @@ def _icc_profile(name):
     return header + struct.pack(">I", len(tags)) + table + body
 
 
-# only where a color is painted (fill="#..", style="fill: #..", color: #..), not in the text
-# of a label
-_HEX = re.compile(r"((?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*[\"']?\s*)"
-                  r"(#[0-9a-fA-F]{6})\b")
-_PNG_URI = re.compile(r"(data:image/png;base64,\s*)([A-Za-z0-9+/=\s]+)")
-
-
 def _png_chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(
         ">I", zlib.crc32(kind + data))
 
 
-def _apply_color_space(svg, space):
-    """Say that the numbers of *svg* are in *space*: painted hex colors become
-    ``color(space r g b)``, and PNG images get the ICC profile of the space."""
-    if space in (None, "srgb"):
-        return svg
-    _space(space)
-    css = lambda m: m.group(1) + "color({} {})".format(space, " ".join(
-        f"{int(m.group(2)[i:i + 2], 16) / 255:.5g}" for i in (1, 3, 5)))
-    svg = _HEX.sub(css, svg)
+def _tag_png_uri(uri, space):
+    """The ``data:image/png;base64,...`` URI *uri* with the ICC profile of *space* in
+    the PNG (after the IHDR chunk), unless it has one already."""
+    head, _, data = uri.partition("base64,")
+    png = base64.b64decode(data)
+    end = 8 + 12 + 13        # the signature and the IHDR chunk
+    if png[:8] != b"\x89PNG\r\n\x1a\n" or b"iCCP" in png[:end + 64]:
+        return uri
     iccp = _png_chunk(b"iCCP", space.encode() + b"\0\0" + zlib.compress(_icc_profile(space)))
-
-    def tag(m):
-        png = base64.b64decode(m.group(2))
-        end = 8 + 12 + 13        # the signature and the IHDR chunk
-        if png[:8] != b"\x89PNG\r\n\x1a\n" or b"iCCP" in png[:end + 64]:
-            return m.group(0)
-        return m.group(1) + base64.b64encode(png[:end] + iccp + png[end:]).decode("ascii")
-    return _PNG_URI.sub(tag, svg)
+    return head + "base64," + base64.b64encode(png[:end] + iccp + png[end:]).decode("ascii")
 
 
 class UmbruchBridge:
@@ -795,6 +781,16 @@ def _check_xml(fragment):
 
 
 class _RawWriter(_XMLWriter):
+    #: the color space of the figure: PNG images are written with its ICC profile
+    color_space = None
+
+    def element(self, tag, text="", attrib={}, **extra):
+        href = attrib.get("xlink:href", "")
+        if tag == "image" and self.color_space not in (None, "srgb") \
+                and href.startswith("data:image/png;base64,"):
+            attrib = {**attrib, "xlink:href": _tag_png_uri(href, self.color_space)}
+        super().element(tag, text, attrib, **extra)
+
     def raw(self, s):
         # Pretty-printing would insert whitespace between inline elements.
         self._XMLWriter__flush()
@@ -809,6 +805,7 @@ class RendererUmbruch(RendererSVG):
         self.writer.__class__ = _RawWriter
         self.bridge = bridge
         self.color_space = color_space
+        self.writer.color_space = color_space
         self._fonts = {}
         self._math = False
 
@@ -830,6 +827,32 @@ class RendererUmbruch(RendererSVG):
             if attrib.get("stroke", "").startswith("#"):
                 attrib["stroke"] = self._css_color(gc.get_rgb())
         return attrib
+
+    def _write_hatches(self):
+        """As stock SVG, with the colors of the pattern in the figure's color space."""
+        if self.color_space in (None, "srgb"):
+            return super()._write_hatches()
+        if not len(self._hatchd):
+            return
+        size = 72
+        wr = self.writer
+        wr.start("defs")
+        for (path, face, stroke, lw), oid in self._hatchd.values():
+            wr.start("pattern", id=oid, patternUnits="userSpaceOnUse", x="0", y="0",
+                     width=str(size), height=str(size))
+            path_data = self._convert_path(
+                path, Affine2D().scale(size).scale(1.0, -1.0).translate(0, size),
+                simplify=False)
+            wr.element("rect", x="0", y="0", width=str(size + 1), height=str(size + 1),
+                       fill="none" if face is None else self._css_color(face))
+            style = {"fill": self._css_color(stroke), "stroke": self._css_color(stroke),
+                     "stroke-width": str(lw), "stroke-linecap": "butt",
+                     "stroke-linejoin": "miter"}
+            if stroke[3] < 1:
+                style["stroke-opacity"] = str(stroke[3])
+            wr.element("path", d=path_data, style=_generate_css(style))
+            wr.end("pattern")
+        wr.end("defs")
 
     # -- text ---------------------------------------------------------------
 
@@ -920,9 +943,9 @@ class RendererUmbruch(RendererSVG):
         mode = config.gouraud
         if mode == "auto":
             mode = "native" if "mesh_gouraud" in self.bridge.capabilities else "subdivide"
-        if mode == "stock":
-            return super().draw_gouraud_triangles(gc, triangles_array, colors_array,
-                                                  transform)
+        if mode not in ("native", "subdivide"):
+            raise ValueError(f"config.gouraud must be 'auto', 'subdivide' or 'native', "
+                             f"not {mode!r}")
         wr = self.writer
         trans = self._make_flip_transform(transform.frozen())
         cols = np.asarray(colors_array, dtype=float)
@@ -1022,9 +1045,7 @@ class FigureCanvasUmbruch(FigureCanvasSVG):
             _space(space)
         buf = io.StringIO()
         size = self._draw_to(buf, bridge, bbox_inches_restore, metadata, space)
-        # what the renderer wrote precisely stays; this catches the hex colors of stock
-        # SVG that it does not override (hatches, stock Gouraud), and tags the images
-        return _apply_color_space(buf.getvalue(), space), size
+        return buf.getvalue(), size
 
     def print_svg(self, filename, *, bbox_inches_restore=None, metadata=None,
                   color_space=None, **kwargs):
