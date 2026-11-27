@@ -643,3 +643,39 @@ def test_native_mesh_matches_subdivided_triangles_and_is_smaller(real_bridge, tm
         results[mode] = (pdf.stat().st_size, np.asarray(Image.open(tmp_path / f"{mode}.png").convert("RGB"), dtype=int))
     assert np.abs(results["native"][1] - results["subdivide"][1]).mean() < 4
     assert results["native"][0] < results["subdivide"][0] / 2
+
+
+@need_umbruch
+def test_embedded_fonts_measure_the_same_in_every_request(real_bridge):
+    """umbruch's server only applies an @font-face family in the first request that declares it; later
+    requests measured in the fallback font, 9 % narrower for Noto Sans, and the text was cut off at
+    the width of its box.  The same text must measure the same however many requests came before."""
+    from matplotlib.font_manager import FontProperties
+    font = hb._font_spec(FontProperties(family="DejaVu Sans", size=6.5, style="italic"))
+    if not font["face"]:
+        pytest.skip("Matplotlib's font entries do not match the file it found (no face to embed)")
+    text = "default; bright, from the data"
+    real_bridge._cache.clear()
+    real_bridge.measure_many([("first request", font)])
+    real_bridge.measure_many([("second request", font)])
+    real_bridge.measure_many([(text, font)])
+    later = real_bridge._cache[real_bridge.key(text, font)][0]
+    fresh = hb.UmbruchServer()
+    fresh.measure_many([(text, font)])
+    assert later == pytest.approx(fresh._cache[fresh.key(text, font)][0])
+    fallback = real_bridge.server.measure([{"markup": text, "css": font["css"].replace(
+        font["face"]["alias"], "no-such-face")}])[0]["width"]
+    assert later != pytest.approx(fallback, abs=1)          # not the fallback font
+
+
+def test_fresh_aliases_rename_every_embedded_family_per_request():
+    rules = "@font-face{font-family:'mpl-0123456789ab';src:url(x)}@font-face{font-family:'mpl-fedcba987654';src:url(y)}"
+    probes = [("text", "font-family:'mpl-0123456789ab', 'Noto Sans';font-size:6px"),
+              ("<math style=\"font-family:'mpl-fedcba987654'\">x</math>", "font-family:sans-serif")]
+    r1, p1 = hb.UmbruchServer._fresh_aliases(rules, probes)
+    r2, p2 = hb.UmbruchServer._fresh_aliases(rules, probes)
+    assert r1 != r2 and p1 != p2                                    # new names for every request
+    assert "mpl-0123456789ab-" in r1 and "mpl-0123456789ab-" in p1[0][1] and "mpl-fedcba987654-" in p1[1][0]
+    assert "src:url(x)" in r1 and "'Noto Sans'" in p1[0][1] and p1[1][1] == probes[1][1]
+    tag = re.search(r"mpl-0123456789ab(-\d+)'", r1).group(1)
+    assert f"mpl-fedcba987654{tag}'" in r1 and f"mpl-0123456789ab{tag}'" in p1[0][1]      # the same suffix everywhere
