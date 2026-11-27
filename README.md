@@ -28,7 +28,20 @@ Fonts come from Matplotlib: for every text, the font file that `font_manager.fin
 
 Tick labels with exponents (`10^3`, `1×10^-4`) are set as text with superscripts in the label font, not as math. Math in `$...$` is converted to MathML and set in STIX Two Math by default. `mathtext.fontset = "cm"` selects Latin Modern Math, and `umbruch_matplotlib.config.math_font` takes the family of any OpenType math font that Matplotlib finds (for example `"Libertinus Math"`, sent to umbruch like the text fonts) or the path of a font file; it needs a font with an OpenType MATH table. Gouraud triangles are subdivided until umbruch reports `mesh_gouraud`.
 
-Matplotlib only knows sRGB. To get colours outside it into the PDF, plot with an sRGB stand-in and map it: `umbruch_matplotlib.config.wide_colors = {"#0a5fb4": "oklch(0.55 0.2 255)"}`. Before rendering, every painted use of the stand-in (`fill`, `stroke`, `stop-color`, `color`, not label text) is replaced by the CSS Color 4 value, which umbruch writes in an ICC space. Pick stand-ins that no other colour in the figure shares; images stay sRGB.
+### Wide-gamut colours
+
+Matplotlib has no colour management: every RGB value (colours, colormaps, image pixels) is three numbers in [0, 1]. Say which space they are in, and umbruch writes the PDF in that space:
+
+```python
+umbruch_matplotlib.config.color_space = "display-p3"   # or fig.savefig(..., color_space="display-p3")
+ax.plot(x, y, color=(0.1, 0.9, 0.3))                   # these numbers are Display P3
+```
+
+The spaces are those of CSS Color 4: `srgb` (the default), `display-p3`, `a98-rgb`, `prophoto-rgb` and `rec2020`. Painted colours (fill, stroke, gradient stops, text) are written as `color(display-p3 r g b)`, so values are quantised to 8 bits as Matplotlib writes them.
+
+Everything Matplotlib itself supplies as sRGB (names like `"red"`, hex colours, the default colour cycle, the built-in colormaps) is then misread as P3 numbers. Convert it: `convert_color("tab:blue", dst="display-p3")` and `convert_cmap("viridis", dst="display-p3")` return values in the target space, clipped to its gamut.
+
+Raster images (`imshow`, rasterised artists) get an ICC profile of the space in their PNG. Today's umbruch ignores the profile of an image in SVG, so images are still read as sRGB; the tests skip that check until it does. Mixed-up colours between flat and image are thus possible for now. The native Gouraud mesh markup (`data-colors`) is in the figure's space too, and umbruch will have to be told so.
 
 ## Examples
 

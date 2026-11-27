@@ -384,36 +384,64 @@ def test_math_font_in_the_pdf(real_bridge, math_font, tmp_path, font, expect):
     assert (font is None) == ("LatinModern" not in fonts), fonts
 
 
-@need_umbruch
-@pytest.mark.skip(reason="work in progress: needs an umbruch that reads the ICC profile of PNG images")
-@pytest.mark.skipif(not shutil.which("pdftoppm"), reason="needs pdftoppm")
-@pytest.mark.parametrize("space", ["srgb", "display-p3", "rec2020"])
-def test_flat_colors_and_images_agree_in_a_color_space(real_bridge, tmp_path, space):
-    """The same numbers painted flat and as image pixels end up as the same color."""
+def _pixel(tmp_path, make, name, space):
     from PIL import Image
-    rgb = (0.1, 0.9, 0.3)
+    fig = make()
+    pdf = tmp_path / f"{name}.pdf"
+    fig.savefig(pdf, color_space=space)
+    plt.close(fig)
+    subprocess.run(["pdftoppm", "-r", "20", "-png", "-singlefile", str(pdf),
+                    str(tmp_path / name)], check=True)
+    return np.array(Image.open(tmp_path / f"{name}.png").convert("RGB").getpixel((10, 10)))
 
-    def pixel(make, name):
-        fig = make()
-        pdf = tmp_path / f"{name}.pdf"
-        fig.savefig(pdf, color_space=space)
-        plt.close(fig)
-        subprocess.run(["pdftoppm", "-r", "20", "-png", "-singlefile", str(pdf),
-                        str(tmp_path / name)], check=True)
-        return np.array(Image.open(tmp_path / f"{name}.png").convert("RGB").getpixel((10, 10)))
 
-    def flat():
-        return plt.figure(figsize=(1, 1), facecolor=rgb)
+def _flat(rgb):
+    return lambda: plt.figure(figsize=(1, 1), facecolor=rgb)
 
-    def image():
+
+def _image(rgb):
+    def make():
         fig = plt.figure(figsize=(1, 1))
         ax = fig.add_axes([0, 0, 1, 1])
         ax.axis("off")
         ax.imshow(np.full((8, 8, 3), rgb), interpolation="nearest", aspect="auto")
         return fig
+    return make
 
-    a, b = pixel(flat, "flat"), pixel(image, "image")
+
+@need_umbruch
+@pytest.mark.skipif(not shutil.which("pdftoppm"), reason="needs pdftoppm")
+@pytest.mark.parametrize("space", ["display-p3", "a98-rgb", "prophoto-rgb", "rec2020"])
+def test_flat_colors_are_read_in_the_color_space(real_bridge, tmp_path, space):
+    """umbruch's reading of color(<space> ...) agrees with convert_color."""
+    rgb = (0.1, 0.9, 0.3)
+    got = _pixel(tmp_path, _flat(rgb), "flat", space)
+    want = np.round(255 * np.array(hb.convert_color(rgb, space, "srgb")[:3]))
+    assert np.abs(got - want).max() <= 6, (space, got, want)
+    # and it is not the same numbers read as sRGB
+    assert np.abs(got - np.round(255 * np.array(rgb))).max() > 10
+
+
+def _umbruch_reads_image_profiles(bridge):
+    import base64
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(buf, "PNG")
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"'
+           ' width="10" height="10"><image width="10" height="10" xlink:href="data:image/png;'
+           f'base64,{base64.b64encode(buf.getvalue()).decode()}"/></svg>')
+    pdf = bridge.render(hb._apply_color_space(svg, "display-p3"), 10, 10)
+    return re.search(rb"/Subtype\s*/Image.{0,80}ICCBased", pdf, re.S) is not None
+
+
+@need_umbruch
+@pytest.mark.skipif(not shutil.which("pdftoppm"), reason="needs pdftoppm")
+@pytest.mark.parametrize("space", ["display-p3", "rec2020"])
+def test_images_agree_with_flat_colors_in_the_color_space(real_bridge, tmp_path, space):
+    """The same numbers as image pixels and as a flat color end up as the same color.
+    Needs an umbruch that uses the ICC profile of a PNG in an SVG <image>."""
+    if not _umbruch_reads_image_profiles(real_bridge):
+        pytest.skip("this umbruch ignores the ICC profile of images in SVG")
+    rgb = (0.1, 0.9, 0.3)
+    a, b = _pixel(tmp_path, _flat(rgb), "flat", space), _pixel(tmp_path, _image(rgb), "img", space)
     assert np.abs(a - b).max() <= 3, (space, a, b)
-    if space != "srgb":
-        srgb = pixel(lambda: plt.figure(figsize=(1, 1), facecolor=rgb), "srgb")  # in P3 numbers
-        assert np.abs(a - np.array([26, 230, 76])).max() > 10   # not read as sRGB
